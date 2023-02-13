@@ -31,9 +31,8 @@ def make_args():
     args = parser.parse_args()
     return args
 
-if __name__ == "__main__":
-    logger.info("model train begin")
-    args = make_args()
+def model_adaptation(args):
+    logger.info("The unit test model adaption")
     cuda = args.device != 'cpu' and torch.cuda.is_available()
     device = torch.device(f'cuda:{args.device}' if cuda else "cpu")
     cfg = Config.fromfile(args.config)
@@ -59,7 +58,11 @@ if __name__ == "__main__":
         f.seek(0)
         onnx_model = onnx.load(f)
         onnx.checker.check_model(onnx_model) 
-        
+        logger.info("The model has been successfully exported")
     onnx_model, check = onnxsim.simplify(onnx_model)
     onnx.save(onnx_model, export_file)
+    
+if __name__ == "__main__":
+    args = make_args()
+    model_adaptation(args)
             
