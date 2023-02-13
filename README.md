@@ -1,2 +1,3 @@
 # YOLOv6-OBB
-YOLOv6 旋转框适配
+yolov6_obb 旋转框适配
+[模型层次的修改](https://zhuanlan.zhihu.com/p/605364409)
