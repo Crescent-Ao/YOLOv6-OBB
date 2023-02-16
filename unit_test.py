@@ -14,6 +14,11 @@ import onnx
 import onnxsim
 from yolov6_obb.utils.config import Config
 import onnxruntime
+import ipdb
+from yolov6_obb.utils.envs import get_envs, select_device, set_random_seed
+from yolov6_obb.data.datasets import *
+from yolov6_obb.data.data_load import *
+from tqdm import tqdm
 ROOT = os.getcwd()
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
@@ -21,16 +26,54 @@ if str(ROOT) not in sys.path:
 def make_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='image size')  # height, width
-    parser.add_argument('--batch-size', type=int, default=1, help='batch size')
+    parser.add_argument('--batch-size', type=int, default=8, help='batch size')
     parser.add_argument('--half', action='store_true', help='FP16 half-precision export')
     parser.add_argument('--inplace', action='store_true', help='set Detect() inplace=True')
     parser.add_argument('--simplify', action='store_true', help='simplify onnx model')
     parser.add_argument('--dynamic-batch', action='store_true', help='export dynamic batch onnx model')
     parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--config', default='/home/crescent/YOLOv6-OBB/configs/repopt/yolov6s_opt.py',help='Model configuration')
+    parser.add_argument('--img_size', default=640,help = 'Dataloader img size')
+    parser.add_argument('--anno_file_name', default='/home/crescent/YOLOv6-OBB/train_DroneVehicle.txt')
+    parser.add_argument('--dist_url', default='env://', type=str, help='url used to set up distributed training')
+    parser.add_argument('--gpu_count', type=int, default=0)
+    parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter')
+    parser.add_argument('--workers', default=8, type=int, help='number of data loading workers (default: 8)')
     args = parser.parse_args()
     return args
 
+def model_dataloader(args):
+    args.rank, args.local_rank, args.world_size = get_envs()
+    logger.info("The unit test dataset and dataloader")
+    master_process = args.rank == 0 if args.world_size > 1 else args.rank == -1
+    device = select_device(args.device)
+    # set random seed
+    set_random_seed(1+args.rank, deterministic=(args.rank == -1))
+    logger.info(device)
+    args.rank, args.local_rank, args.world_size = get_envs()
+    logger.info(f"training args are: {args}\n")
+    if args.local_rank != -1: # if DDP mode
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device('cuda', args.local_rank)
+        logger.info('Initializing process group... ')
+        dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo", \
+                init_method=args.dist_url, rank=args.local_rank, world_size=args.world_size)
+    """def create_dataloader(
+    anno_file_name,
+    img_size,
+    batch_size,
+    rank = -1
+    workers = 8,
+    shuffle = False,
+    data_dict = None,
+):
+    """
+    train_loader = create_dataloader(args.anno_file_name, args.img_size[0], args.batch_size,
+                                     args.local_rank,args.workers)[0]
+    for i in range(10):
+        for imgs,bboxes in train_loader:
+            logger.info(f"The img shape{imgs.shape}\n\
+                The bboxes shape{bboxes.shape}")
 def model_adaptation(args):
     logger.info("The unit test model adaption")
     cuda = args.device != 'cpu' and torch.cuda.is_available()
@@ -44,8 +87,9 @@ def model_adaptation(args):
     img = torch.zeros(args.batch_size,3,*args.img_size).to(device)
     if args.half:
         img, model = img.half(),model.half()
-    model.eval()
-    output = model(img)
+    model.train()
+    x,feature_map = model(img)
+    ipdb.set_trace()
     logger.info("\n Starting to export onnx")
     export_file = '/home/crescent/YOLOv6-OBB/demo.onnx'
     with BytesIO() as f:
@@ -64,5 +108,5 @@ def model_adaptation(args):
     
 if __name__ == "__main__":
     args = make_args()
-    model_adaptation(args)
+    model_dataloader(args)
             

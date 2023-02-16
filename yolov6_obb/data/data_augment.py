@@ -1,12 +1,12 @@
 import cv2 as cv2
 import numpy as np
 import imgaug.augmenters as iaa
-
+import random
 class HSV(object):
     def __init__(self,p=0.75,hgain=0.5,sgain=0.5,vgain=0.5):
-        self.__dict__update(locals)
-    def __call__(img,boxes):
-        if(random.random()<p):
+        self.__dict__.update(locals())
+    def __call__(self,img,bboxes):
+        if(random.random()<self.p):
             x = np.random.uniform(-1, 1, 3) * [self.hgain, self.sgain, self.vgain] + 1
             img_hsv = (cv2.cvtColor(img, cv2.COLOR_BGR2HSV) * x).clip(None, 255).astype(np.uint8)
             np.clip(img_hsv[:, :, 0], None, 179, out=img_hsv[:, :, 0])
@@ -15,7 +15,7 @@ class HSV(object):
 
 class Blur(object):
     def __init__(self, sigma=1.3, p=0.15):
-        self.__dict__update(locals)
+        self.__dict__.update(locals())
     def __call__(self, img, bboxes):
         if random.random() < self.p:
             blur_aug = iaa.GaussianBlur(sigma=(0, self.sigma))
@@ -24,7 +24,7 @@ class Blur(object):
 
 class Grayscale(object):
     def __init__(self, grayscale=0.3, p=0.5):
-        self.__dict__update(locals)
+        self.__dict__.update(locals())
     def __call__(self, img, bboxes):
         if random.random() < self.p:
             gray_aug = iaa.Grayscale(alpha=(self.alpha, 1.0))
@@ -33,7 +33,7 @@ class Grayscale(object):
 
 class Gamma(object):
     def __init__(self, intensity=0.2, p=0.3):
-        self.__dict__update(locals)
+        self.__dict__.update(locals())
     def __call__(self, img, bboxes):
         if random.random() < self.p:
             gm = random.uniform(1 - self.intensity, 1 + self.intensity)
@@ -42,7 +42,7 @@ class Gamma(object):
     
 class Noise(object):
     def __init__(self, intensity=0.01, p=0.15):
-        self.__dict__update(locals)
+        self.__dict__.update(locals())
     def __call__(self, img, bboxes):
         if random.random() < self.p:
             noise_aug = iaa.AdditiveGaussianNoise(scale=(0, self.intensity * 255))
@@ -51,7 +51,7 @@ class Noise(object):
 
 class Sharpen(object):
     def __init__(self, intensity=0.15, p=0.2):
-        self.__dict__update(locals)
+        self.__dict__.update(locals())
     def __call__(self, img, bboxes):
         if random.random() < self.p:
             sharpen_aug = iaa.Sharpen(alpha=(0.0, 1.0), lightness=(1 - self.intensity, 1 + self.intensity))
@@ -59,7 +59,7 @@ class Sharpen(object):
         return img, bboxes 
 class Contrast(object):
     def __init__(self, intensity=0.15, p=0.3):
-        self.__dict__update(locals)
+        self.__dict__.update(locals())
     def __call__(self, img, bboxes):
         if random.random() < self.p:
             contrast_aug = iaa.contrast.LinearContrast((1 - self.intensity, 1 + self.intensity))

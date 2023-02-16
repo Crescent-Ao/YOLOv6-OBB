@@ -7,12 +7,13 @@ from torch.utils.data import Dataset
 from loguru import logger
 import tqdm
 import time
-import .data_augment as DataAug
-
+import yolov6_obb.data.data_augment as DataAug
+import random
 class TrainValDataset(Dataset):
     def __init__(
         self,
         anno_file_name,
+        batch_size = 8,
         stride=32,
         img_size=640,
         rank=-1,
@@ -30,7 +31,8 @@ class TrainValDataset(Dataset):
         t1 = time.time()
         self.__dict__.update(locals())
         self.main_process = self.rank in (-1,0)
-        self.class_names = data_dict.keys()
+        if self.data_dict is not None:
+            self.class_names = data_dict.keys()
         self.annotations = self.load_annotations(anno_file_name)
         t2 = time.time()
         
@@ -44,23 +46,23 @@ class TrainValDataset(Dataset):
         img_mix = img_mix.transpose(2, 0, 1)
         img, bboxes = DataAug.Mixup()(img_org, bboxes_org, img_mix, bboxes_mix)
         del img_org, bboxes_org, img_mix, bboxes_mix   
-        bboxes = self.create_label(bboxes)
+        bboxes = self.create_label(torch.from_numpy(bboxes))
         img = torch.from_numpy(np.ascontiguousarray(img))
         return img,bboxes
         
     def __len__(self):
         return len(self.annotations)  
     def load_annotations(self,anno_file_name):
-        with open(anno_path, 'r') as f:
+        with open(anno_file_name, 'r') as f:
             annotations = list(filter(lambda x:len(x)>0,f.readlines()))
-        assert len(annotations>0), f"There is no annotation in {self.anno_file_name}"
+        assert len(annotations)>0, f"There is no annotation in {self.anno_file_name}"
         annotations = [x.strip().split(' ') for x in annotations]
         return annotations
-    def parser_annotation(self,index):
+    def parse_annotation(self,index):
         cur_anno = self.annotations[index]
         img =  cv2.imread(cur_anno[0])
         assert img is not None, f"{cur_anno[0]} file not found"
-        bboxes = np.array([list(map(float, box.split(','))) for box in anno[1:]])
+        bboxes = np.array([list(map(float, box.split(','))) for box in cur_anno[1:]])
         img, bboxes = DataAug.RandomVerticalFilp()(np.copy(img), np.copy(bboxes))
         img, bboxes = DataAug.RandomHorizontalFilp()(np.copy(img), np.copy(bboxes))
         img, bboxes = DataAug.HSV()(np.copy(img), np.copy(bboxes))
@@ -71,11 +73,14 @@ class TrainValDataset(Dataset):
     def create_label(self,bboxes):
         # [none,class_id,xmin,ymin,xmax,ymax,c_x_r,c_y_r,a1,a2,a3,a4,area_ratio,angle]
         bboxes_out = torch.zeros(len(bboxes),2+4+2+4+2)
-        for gt_label in bboxes:
+        for i,gt_label in enumerate(bboxes):
             bbox_xyxy = gt_label[:4]
             bbox_obb = gt_label[5:13]
             xmin, ymin, xmax, ymax = bbox_xyxy
-            bboxes_out[:,2:6] = bbox_xyxy
+            box_w = (xmax - xmin)
+            box_h = (ymax - ymin)
+            xmin, ymin, xmax, ymax = bbox_xyxy
+            bboxes_out[i,2:6] = bbox_xyxy
             c_x = (xmax + xmin) / 2
             c_y = (ymax + ymin) / 2
             if gt_label[13]>0.9:
@@ -93,17 +98,17 @@ class TrainValDataset(Dataset):
             # [none,class_id,xmin,ymin,xmax,ymax,c_x_r,c_y_r,a1,a2,a3,a4,area_ratio,angle]
             # 后续可以转换成角度
             angle = gt_label[14]*np.pi/180
-            bboxes_out[:,6] = c_x_r
-            bboxes_out[:,7] = c_y_r
-            bboxes_out[:,8:12] = [a1,a2,a3,a4]
-            bboxes_out[:,12] = gt_label[13]
-            bboxes_out[:,13] = angle
+            bboxes_out[i,6] = c_x_r
+            bboxes_out[i,7] = c_y_r
+            bboxes_out[i,8:12] = torch.tensor([a1,a2,a3,a4])
+            bboxes_out[i,12] = gt_label[13]
+            bboxes_out[i,13] = angle
         return bboxes_out          
     @staticmethod
     def collate_fn(batch):
         img, label = zip(*batch)
         for i,l in enumerate(label):
-            i[:,0] = i
+            l[:,0] = i
         return torch.stack(img,0), torch.cat(label,0)        
             
         
