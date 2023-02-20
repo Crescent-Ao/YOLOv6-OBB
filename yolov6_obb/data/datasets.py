@@ -8,6 +8,7 @@ from loguru import logger
 import tqdm
 import time
 import yolov6_obb.data.data_augment as DataAug
+from yolov6_obb.utils.obb_utils import *
 import random
 class TrainValDataset(Dataset):
     def __init__(
@@ -46,7 +47,7 @@ class TrainValDataset(Dataset):
         img_mix = img_mix.transpose(2, 0, 1)
         img, bboxes = DataAug.Mixup()(img_org, bboxes_org, img_mix, bboxes_mix)
         del img_org, bboxes_org, img_mix, bboxes_mix   
-        bboxes = self.create_label(torch.from_numpy(bboxes))
+        bboxes = self.create_label(bboxes,False)
         img = torch.from_numpy(np.ascontiguousarray(img))
         return img,bboxes
         
@@ -70,39 +71,50 @@ class TrainValDataset(Dataset):
         img, bboxes = DataAug.RandomAffine()(np.copy(img), np.copy(bboxes))
         img, bboxes = DataAug.Resize((self.img_size, self.img_size), True)(np.copy(img), np.copy(bboxes))
         return img, bboxes
-    def create_label(self,bboxes):
+    def create_label(self,bboxes,eight_parameter = False):
         # [none,class_id,xmin,ymin,xmax,ymax,c_x_r,c_y_r,a1,a2,a3,a4,area_ratio,angle]
-        bboxes_out = torch.zeros(len(bboxes),2+4+2+4+2)
-        for i,gt_label in enumerate(bboxes):
-            bbox_xyxy = gt_label[:4]
-            bbox_obb = gt_label[5:13]
-            xmin, ymin, xmax, ymax = bbox_xyxy
-            box_w = (xmax - xmin)
-            box_h = (ymax - ymin)
-            xmin, ymin, xmax, ymax = bbox_xyxy
-            bboxes_out[i,2:6] = bbox_xyxy
-            c_x = (xmax + xmin) / 2
-            c_y = (ymax + ymin) / 2
-            if gt_label[13]>0.9:
-                a1 = a2 = a3 = a4 = 0   
-            else:
-                a1 = (bbox_obb[0] - bbox_xyxy[0]) / box_w
-                a2 = (bbox_obb[3] - bbox_xyxy[1]) / box_h
-                a3 = (bbox_xyxy[2] - bbox_obb[4]) / box_w
-                a4 = (bbox_xyxy[3] - bbox_obb[7]) / box_h
-            class_id = int(gt_label[4])
-            bboxes_out[:,1] = class_id
-            c_x_r = (bbox_obb[0] + bbox_obb[2] + bbox_obb[4] + bbox_obb[6]) / 4
-            c_y_r = (bbox_obb[1] + bbox_obb[3] + bbox_obb[5] + bbox_obb[7]) / 4
-            # 样本的中心点，按照点来分配利用这个来分配
-            # [none,class_id,xmin,ymin,xmax,ymax,c_x_r,c_y_r,a1,a2,a3,a4,area_ratio,angle]
-            # 后续可以转换成角度
-            angle = gt_label[14]*np.pi/180
-            bboxes_out[i,6] = c_x_r
-            bboxes_out[i,7] = c_y_r
-            bboxes_out[i,8:12] = torch.tensor([a1,a2,a3,a4])
-            bboxes_out[i,12] = gt_label[13]
-            bboxes_out[i,13] = angle
+        if(not eight_parameter):
+            #[none, c_x, c_y, w, h, class_id]  
+            bboxes_out = torch.zeros(len(bboxes), 1+1+4+1)
+            bbox_obb = bboxes[:,5:13] # [class_id,x1,y1,x2,y2,x3,y3,x4,y4]
+            target_obb = []
+            for bbox_poly in bbox_obb:
+                target_obb.append(poly2obb_np(bbox_poly))
+            bboxes_out[:,2:] = torch.from_numpy(np.array(target_obb)).reshape(-1,5)
+            bboxes_out[:,1] = torch.from_numpy(np.int32(bboxes[:,4]))
+        else:
+            bboxes = torch.from_numpy(bboxes)
+            bboxes_out = torch.zeros(len(bboxes),2+4+2+4+2)
+            for i,gt_label in enumerate(bboxes):
+                bbox_xyxy = gt_label[:4]
+                bbox_obb = gt_label[5:13]
+                xmin, ymin, xmax, ymax = bbox_xyxy
+                box_w = (xmax - xmin)
+                box_h = (ymax - ymin)
+                xmin, ymin, xmax, ymax = bbox_xyxy
+                bboxes_out[i,2:6] = bbox_xyxy
+                c_x = (xmax + xmin) / 2
+                c_y = (ymax + ymin) / 2
+                if gt_label[13]>0.9:
+                    a1 = a2 = a3 = a4 = 0   
+                else:
+                    a1 = (bbox_obb[0] - bbox_xyxy[0]) / box_w
+                    a2 = (bbox_obb[3] - bbox_xyxy[1]) / box_h
+                    a3 = (bbox_xyxy[2] - bbox_obb[4]) / box_w
+                    a4 = (bbox_xyxy[3] - bbox_obb[7]) / box_h
+                class_id = int(gt_label[4])
+                bboxes_out[:,1] = class_id
+                c_x_r = (bbox_obb[0] + bbox_obb[2] + bbox_obb[4] + bbox_obb[6]) / 4
+                c_y_r = (bbox_obb[1] + bbox_obb[3] + bbox_obb[5] + bbox_obb[7]) / 4
+                # 样本的中心点，按照点来分配利用这个来分配
+                # [none,class_id,xmin,ymin,xmax,ymax,c_x_r,c_y_r,a1,a2,a3,a4,area_ratio,angle]
+                # 后续可以转换成角度
+                angle = gt_label[14]*np.pi/180
+                bboxes_out[i,6] = c_x_r
+                bboxes_out[i,7] = c_y_r
+                bboxes_out[i,8:12] = torch.tensor([a1,a2,a3,a4])
+                bboxes_out[i,12] = gt_label[13]
+                bboxes_out[i,13] = angle
         return bboxes_out          
     @staticmethod
     def collate_fn(batch):

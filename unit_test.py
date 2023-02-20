@@ -18,7 +18,9 @@ import ipdb
 from yolov6_obb.utils.envs import get_envs, select_device, set_random_seed
 from yolov6_obb.data.datasets import *
 from yolov6_obb.data.data_load import *
+from yolov6_obb.utils.obb_utils import obb_vis
 from tqdm import tqdm
+import torch.distributed as dist
 ROOT = os.getcwd()
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
@@ -42,11 +44,13 @@ def make_args():
     args = parser.parse_args()
     return args
 
-def model_dataloader(args):
+def model_dataloader(args,visualize=True):
     args.rank, args.local_rank, args.world_size = get_envs()
     logger.info("The unit test dataset and dataloader")
     master_process = args.rank == 0 if args.world_size > 1 else args.rank == -1
     device = select_device(args.device)
+    if(visualize):
+        args.batch_size = 1
     # set random seed
     set_random_seed(1+args.rank, deterministic=(args.rank == -1))
     logger.info(device)
@@ -58,22 +62,39 @@ def model_dataloader(args):
         logger.info('Initializing process group... ')
         dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo", \
                 init_method=args.dist_url, rank=args.local_rank, world_size=args.world_size)
-    """def create_dataloader(
-    anno_file_name,
-    img_size,
-    batch_size,
-    rank = -1
-    workers = 8,
-    shuffle = False,
-    data_dict = None,
+    """
+        def create_dataloader(
+            anno_file_name,
+            img_size,
+            batch_size,
+            rank = -1
+            workers = 8,
+            shuffle = False,
+            data_dict = None,
 ):
     """
     train_loader = create_dataloader(args.anno_file_name, args.img_size[0], args.batch_size,
-                                     args.local_rank,args.workers)[0]
-    for i in range(10):
+                                     args.local_rank,args.workers,shuffle=True)[0]
+   
+    if visualize:
+        img, bboxes = iter(train_loader).__next__()
+        img = img.squeeze(0).permute(1,2,0).detach().cpu().numpy()
+        img = img* 255.0
+        img = img.astype(np.uint8)
+        print(img.shape)
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR).astype(np.float32)
+        print(bboxes)
+        bboxes = bboxes[:,1:] #索引到当前的地址
+        # [x,y,w,h,]
+        obb_vis(img,bboxes)
+    else:
         for imgs,bboxes in train_loader:
             logger.info(f"The img shape{imgs.shape}\n\
-                The bboxes shape{bboxes.shape}")
+            The bboxes shape{bboxes.shape}")
+        
+        
+    
+ 
 def model_adaptation(args):
     logger.info("The unit test model adaption")
     cuda = args.device != 'cpu' and torch.cuda.is_available()
