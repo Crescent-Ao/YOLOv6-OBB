@@ -2,7 +2,9 @@ import torch
 import torch.nn as nn  
 import torch.nn.functional as F  
 import mmcv.ops.box_iou_rotated as box_iou_rotated
-import yolov6_obb.utils.obb_utils.rotated_iou_similarity
+import yolov6_obb.utils.obb_utils.rotated_iou_similarity as rotated_iou_similarity
+import yolov6_obb.utils.obb_utils.check_point_in_rotated_boxes as check_point_in_rotated_boxes
+from yolov6_obb.assigners.assigner_utils import select_highest_overlaps
 class RotatedTaskAlignedAssigner(nn.Module):
     def __init__(self, topk=13, alpha=1.0, beta=6.0, eps=1e-9):
         super(RotatedTaskAlignedAssigner, self).__init__()
@@ -11,7 +13,7 @@ class RotatedTaskAlignedAssigner(nn.Module):
         self.beta = beta
         self.eps = eps
     @torch.no_grad()
-    def forward(self, pred_scores, pred_bboxes, anchor_points, num_anchor_list, gt_labels,gt_bboxes, gt_mask, bg_index,gt_scores=None):
+    def forward(self, pred_scores, pred_bboxes, anchor_points, num_anchor_list, gt_labels,gt_bboxes, mask_gt):
         """
         The assignment is done in following steps
             1. compute alignment metric between all bbox (bbox of all pyramid levels) and gt
@@ -41,19 +43,70 @@ class RotatedTaskAlignedAssigner(nn.Module):
         batch_size, num_anchors, num_classes = pred_scores.shape
         _, num_max_boxes, _ = gt_bboxes.shape
         if num_max_boxes == 0:
-            assigned_labels = torch.full(
-                [batch_size, num_anchors], bg_index, dtype=gt_labels.dtype)
-            assigned_bboxes = torch.zeros([batch_size, num_anchors, 5])
-            assigned_scores = torch.zeros(
-                [batch_size, num_anchors, num_classes])
-            return assigned_labels, assigned_bboxes, assigned_scores 
-        ious = torch.where(ious > 1 + self.eps, torch.zeros_like(ious), ious)
-        pred_scores = pred_scores.permyte(0,2,1)
-        batch_ind = torch.arange(
-            end=batch_size, dtype=gt_labels.dtype).unsqueeze(-1)
-        gt_labels_ind = torch.stack(
-            [batch_ind.tile([1, num_max_boxes]), gt_labels.squeeze(-1)],
-            axis=-1)
-        
-        
-def g
+            device = gt_bboxes.device
+            return torch.full_like(pred_scores[..., 0], self.bg_idx).to(device), \
+                   torch.zeros_like(pred_bboxes).to(device), \
+                   torch.zeros_like(pred_scores).to(device), \
+                   torch.zeros_like(pred_scores[..., 0]).to(device)
+       
+        mask_pos, align_metric, overlaps = self.get_pos_mask(
+            pred_scores, pred_bboxes, gt_labels, gt_bboxes, anchor_points, mask_gt)
+        target_gt_idx, fg_mask, mask_pos = select_highest_overlaps(
+            mask_pos, overlaps, self.n_max_boxes)
+        target_labels, target_bboxes, target_scores = self.get_targets(
+            gt_labels, gt_bboxes, target_gt_idx, fg_mask)
+        # normalize
+        align_metric *= mask_pos
+        pos_align_metrics = align_metric.max(axis=-1, keepdim=True)[0]
+        pos_overlaps = (overlaps * mask_pos).max(axis=-1, keepdim=True)[0]
+        norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).max(-2)[0].unsqueeze(-1)
+        target_scores = target_scores * norm_align_metric
+        return target_labels, target_bboxes, target_scores, fg_mask.bool()
+    def get_pos_mask(self,
+                     pred_scores,
+                     pred_bboxes,
+                     gt_labels,
+                     gt_bboxes,
+                     anchor_points,
+                     mask_gt):
+        align_metric, overlaps = self.get_box_metrics(pred_scores, pred_bboxes, gt_labels, gt_bboxes)
+         # check the positive sample's center in gt, [B, n, L]
+        mask_in_gts = check_point_in_rotated_boxes(anchor_points, gt_bboxes)
+        mask_topk = self.select_topk_candidates(
+            align_metric * mask_in_gts, topk_mask=mask_gt.repeat([1, 1, self.topk]).bool())
+        mask_pos = mask_topk * mask_in_gts * mask_gt
+        return mask_pos, align_metric, overlaps
+    def get_box_metrics(self,
+                        pred_scores,
+                        pred_bboxes,
+                        gt_labels,
+                        gt_bboxes):
+        pred_scores = pred_scores.permute(0, 2, 1)
+        gt_labels = gt_labels.to(torch.long)
+        ind = torch.zeros([2, self.bs, self.n_max_boxes], dtype=torch.long)
+        ind[0] = torch.arange(end=self.bs).view(-1, 1).repeat(1, self.n_max_boxes)
+        ind[1] = gt_labels.squeeze(-1)
+        bbox_scores = pred_scores[ind[0], ind[1]]
+        overlaps = rotated_iou_similarity(gt_bboxes, pred_bboxes)
+        align_metric = bbox_scores.pow(self.alpha) * overlaps.pow(self.beta)
+        return align_metric, overlaps
+    def get_targets(self,
+                    gt_labels,
+                    gt_bboxes,
+                    target_gt_idx,
+                    fg_mask):
+        batch_ind = torch.arange(end=self.bs, dtype=torch.int64, device=gt_labels.device)[...,None]
+        target_gt_idx = target_gt_idx + batch_ind * self.n_max_boxes
+        target_labels = gt_labels.long().flatten()[target_gt_idx]
+
+        # assigned target boxes
+        target_bboxes = gt_bboxes.reshape([-1, 5])[target_gt_idx]
+
+        # assigned target scores
+        target_labels[target_labels<0] = 0
+        target_scores = F.one_hot(target_labels, self.num_classes)
+        fg_scores_mask  = fg_mask[:, :, None].repeat(1, 1, self.num_classes)
+        target_scores = torch.where(fg_scores_mask > 0, target_scores,
+                                        torch.full_like(target_scores, 0))
+
+        return target_labels, target_bboxes, target_scores
