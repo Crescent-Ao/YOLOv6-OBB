@@ -2,6 +2,22 @@ import cv2
 import torch
 import numpy as np
 import os
+import mmcv.ops.box_iou_rotated as rotate_iou
+def rotated_iou_similarity(box1,box2):
+    """Calculate rotate iou of box1 and box2
+    Args:
+        box1 (Tensor): box with the shape [N,M1,5] 
+        box2 (Tensor): box with the shape [N,M2,5]
+    Return:
+        iou (Tensor): box between box1 and box2 with shape [N,M1,M2]
+    """
+    rotated_ious = []
+    for b1, b2 in zip(box1, box2):
+        rotated_ious.append(rotate_iou(b1, b2))
+    return torch.stack(rotate_iou,axis=0)
+    
+    
+    
 def poly2obb_np(rbox:list):
     if rbox.shape[-1] == 9:
         print("")
