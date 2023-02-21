@@ -3,6 +3,26 @@ import torch
 import numpy as np
 import os
 import mmcv.ops.box_iou_rotated as rotate_iou
+def check_point_in_rotated_boxes(points, boxes):
+      # [B, N, 5] -> [B, N, 4, 2]
+    polys = obb2poly(boxes)
+    points = points.unsqueeze(0)
+    a, b, c, d = polys.split(4, axis=2)
+    ab = b - a
+    ad = d - a
+    ap = points - a
+    # [B, N, L]
+    norm_ab = torch.sum(ab * ab, axis=-1)
+    # [B, N, L]
+    norm_ad = torch.sum(ad * ad, axis=-1)
+    # [B, N, L] dot product
+    ap_dot_ab = torch.sum(ap * ab, axis=-1)
+    # [B, N, L] dot product
+    ap_dot_ad = torch.sum(ap * ad, axis=-1)
+    # [B, N, L] <A, B> = |A|*|B|*cos(theta) 
+    is_in_box = (ap_dot_ab >= 0) & (ap_dot_ab <= norm_ab) & (ap_dot_ad >= 0) & (
+        ap_dot_ad <= norm_ad)
+    return is_in_box
 def rotated_iou_similarity(box1,box2):
     """Calculate rotate iou of box1 and box2
     Args:
@@ -16,7 +36,13 @@ def rotated_iou_similarity(box1,box2):
         rotated_ious.append(rotate_iou(b1, b2))
     return torch.stack(rotate_iou,axis=0)
     
-    
+def box2corner(box):
+      """convert box coordinate to corners
+    Args:
+        box (Tensor): (B, N, 5) with (x, y, w, h, alpha) angle is in [0, 90)
+    Returns:
+        corners (Tensor): (B, N, 4, 2) with (x1, y1, x2, y2, x3, y3, x4, y4)
+    """
     
 def poly2obb_np(rbox:list):
     if rbox.shape[-1] == 9:
@@ -53,7 +79,7 @@ def regular_theta(theta, mode='180', start=-np.pi/2):
     return theta + start
 
 
-def obb2poly(obboxes,mode="xyxy"):
+def obb2poly(obboxes):
     center, w, h, theta = torch.split(obboxes, [2, 1, 1, 1], dim=-1)
     Cos, Sin = torch.cos(theta), torch.sin(theta)
     vector1 = torch.cat(
