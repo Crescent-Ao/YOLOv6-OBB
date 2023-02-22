@@ -9,20 +9,21 @@ from yolov6_obb.assigners.anchor_generator import generate_anchors
 from yolov6_obb.utils.general import dist2bbox, bbox2dist, xywh2xyxy
 from yolov6_obb.utils.figure_iou import IOUloss
 from yolov6_obb.assigners.atss_assigner import ATSSAssigner
-from yolov6_obb.assigners.tal_assigner import TaskAlignedAssigner
-
-
+from yolov6_obb.assigners.rotated_tal_assigner import RotatedTaskAlignedAssigner
+from yolov6_obb.utils.figure_iou import ProbIoUloss
 class ComputeLoss:
     '''Loss computation func.'''
     def __init__(self,
                  fpn_strides=[8, 16, 32],
                  grid_cell_size=5.0,
                  grid_cell_offset=0.5,
-                 num_classes=80,
+                 num_classes=10,
                  ori_img_size=640,
                  warmup_epoch=4,
-                 use_dfl=True,
+                 use_reg_dfl=True,
+                 use_angle_dfl=True,
                  reg_max=16,
+                 angle_max = 90,
                  iou_type='giou',
                  loss_weight={
                      'class': 1.0,
@@ -35,14 +36,18 @@ class ComputeLoss:
         self.grid_cell_offset = grid_cell_offset
         self.num_classes = num_classes
         self.ori_img_size = ori_img_size
-
         self.warmup_epoch = warmup_epoch
         self.warmup_assigner = ATSSAssigner(9, num_classes=self.num_classes)
-        self.formal_assigner = TaskAlignedAssigner(topk=13, num_classes=self.num_classes, alpha=1.0, beta=6.0)
-
-        self.use_dfl = use_dfl
+        self.formal_assigner = RotatedTaskAlignedAssigner(topk=13, num_classes=self.num_classes, alpha=1.0, beta=6.0)
+        
+        
+        self.use_reg_dfl = use_reg_dfl
+        self.use_angle_dfl = use_angle_dfl
         self.reg_max = reg_max
-        self.proj = nn.Parameter(torch.linspace(0, self.reg_max, self.reg_max + 1), requires_grad=False)
+        self.angle_max =  angle_max
+        self.reg_proj = nn.Parameter(torch.linspace(0, self.reg_max, self.reg_max + 1), requires_grad=False)
+        self.angle_proj = nn.Parameter(torch.linspace(0, self.angle_max, self.reg_max + 1), requires_grad=False)
+        
         self.iou_type = iou_type
         self.varifocal_loss = VarifocalLoss().cuda()
         self.bbox_loss = BboxLoss(self.num_classes, self.reg_max, self.use_dfl, self.iou_type).cuda()
@@ -58,24 +63,25 @@ class ComputeLoss:
         # feats [x[0]x[1]x[2]] [bs,64,80,80] [bs,128,40,40] [bs,256,20,20]
         # pred_scores [bs,8400,10]
         # cls_score [bs,8400,15]
-        feats, pred_scores, pred_distri = outputs
+        feats, pred_scores, pred_reg_dist, pred_angle_dist = outputs
         anchors, anchor_points, n_anchors_list, stride_tensor = \
                generate_anchors(feats, self.fpn_strides, self.grid_cell_size, self.grid_cell_offset, device=feats[0].device)
-
-        assert pred_scores.type() == pred_distri.type()
+        assert pred_scores.type() == pred_reg_dist.type()
         gt_bboxes_scale = torch.full((1,4), self.ori_img_size).type_as(pred_scores)
         batch_size = pred_scores.shape[0]
-
+        # 获取对应的batch size
         # [class_id,xmin,ymin,xmax,ymax,a1,a2,a3,a4,angle,c_x,c_y,box_w,box_h] 传入的label
-        targets =self.preprocess(targets, batch_size, gt_bboxes_scale)
+        targets = self.preprocess(targets, batch_size, gt_bboxes_scale)
         gt_labels = targets[:, :, :1]
-        gt_bboxes = targets[:, :, 1:] #xyxy
+        gt_bboxes = targets[:, :, 1:] # x y w h theta
         mask_gt = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
-
         # pboxes
-        anchor_points_s = anchor_points / stride_tensor
-        pred_bboxes = self.bbox_decode(anchor_points_s, pred_distri) #xyxy
-
+        anchor_points_s = anchor_points/stride_tensor
+        pred_reg_atss, pred_angle = self.obb_decode(anchor_points_s, pred_reg_dist,\
+                pred_angle_dist,stride_tensor,mode="xyxy")
+        pred_reg_tal, pred_angle = self.obb_decode(anchor_points_s, pred_reg_dist,\
+                pred_angle_dist,stride_tensor,mode="xywh")
+        pred_bboxes = torch.concat([pred_reg_tal*stride_tensor,pred_angle])
         try:
             if epoch_num < self.warmup_epoch:
                 target_labels, target_bboxes, target_scores, fg_mask = \
@@ -85,12 +91,12 @@ class ComputeLoss:
                         gt_labels,
                         gt_bboxes,
                         mask_gt,
-                        pred_bboxes.detach() * stride_tensor)
+                        pred_reg_atss.detach() * stride_tensor)
             else:
                 target_labels, target_bboxes, target_scores, fg_mask = \
                     self.formal_assigner(
                         pred_scores.detach(),
-                        pred_bboxes.detach() * stride_tensor,
+                        torch.cat([pred_reg_tal.detach()*stride_tensor,pred_angle.detach()],axis=-1),
                         anchor_points,
                         gt_labels,
                         gt_bboxes,
@@ -110,9 +116,8 @@ class ComputeLoss:
                 _gt_labels = gt_labels.cpu().float()
                 _gt_bboxes = gt_bboxes.cpu().float()
                 _mask_gt = mask_gt.cpu().float()
-                _pred_bboxes = pred_bboxes.detach().cpu().float()
+                _pred_reg_atss = pred_reg_atss.detach().cpu().float()
                 _stride_tensor = stride_tensor.cpu().float()
-
                 target_labels, target_bboxes, target_scores, fg_mask = \
                     self.warmup_assigner(
                         _anchors,
@@ -120,21 +125,22 @@ class ComputeLoss:
                         _gt_labels,
                         _gt_bboxes,
                         _mask_gt,
-                        _pred_bboxes * _stride_tensor)
+                        _pred_reg_atss * _stride_tensor)
 
             else:
                 _pred_scores = pred_scores.detach().cpu().float()
-                _pred_bboxes = pred_bboxes.detach().cpu().float()
+                _pred_reg_tal = pred_reg_tal.detach().cpu().float()
+                _pred_angle = pred_angle.detach().cpu().float()
                 _anchor_points = anchor_points.cpu().float()
                 _gt_labels = gt_labels.cpu().float()
                 _gt_bboxes = gt_bboxes.cpu().float()
                 _mask_gt = mask_gt.cpu().float()
                 _stride_tensor = stride_tensor.cpu().float()
-
+               
                 target_labels, target_bboxes, target_scores, fg_mask = \
                     self.formal_assigner(
                         _pred_scores,
-                        _pred_bboxes * _stride_tensor,
+                        torch.cat([_pred_reg_tal*_stride_tensor, _pred_angle]),
                         _anchor_points,
                         _gt_labels,
                         _gt_bboxes,
@@ -150,7 +156,7 @@ class ComputeLoss:
 
         # rescale bbox
         target_bboxes /= stride_tensor
-
+        
         # cls loss
         target_labels = torch.where(fg_mask > 0, target_labels, torch.full_like(target_labels, self.num_classes))
         one_hot_label = F.one_hot(target_labels.long(), self.num_classes + 1)[..., :-1]
@@ -161,32 +167,48 @@ class ComputeLoss:
         # if target_scores_sum is 0, loss_cls equals to 0 alson 
         if target_scores_sum > 0:
             loss_cls /= target_scores_sum
-
+        # TODO  pred_bboxes 是解码之后的网络结构
+        # TODO  pred_reg_dis 是没有经过解码的流程
+        # TODO  target
+        
         # bbox loss
-        loss_iou, loss_dfl = self.bbox_loss(pred_distri, pred_bboxes, anchor_points_s, target_bboxes,
-                                            target_scores, target_scores_sum, fg_mask)
+        loss_iou, loss_reg_dfl, loss_angle_dfl = self.bbox_loss(pred_angle_dist,pred_reg_dist,anchor_points_s, target_labels, target_bboxes,target_scores,\
+            target_scores_sum,stride_tensor)
 
         loss = self.loss_weight['class'] * loss_cls + \
                self.loss_weight['iou'] * loss_iou + \
-               self.loss_weight['dfl'] * loss_dfl
+               self.loss_weight['reg_dfl'] * loss_reg_dfl +\
+               self.loss_weight['angle_dfl'] * loss_angle_dfl
 
         return loss, \
             torch.cat(((self.loss_weight['iou'] * loss_iou).unsqueeze(0),
-                         (self.loss_weight['dfl'] * loss_dfl).unsqueeze(0),
-                         (self.loss_weight['class'] * loss_cls).unsqueeze(0))).detach()
+                         (self.loss_weight['reg_dfl'] * loss_reg_dfl).unsqueeze(0),
+                         (self.loss_weight['class'] * loss_cls).unsqueeze(0)),
+                      (self.loss_weight['angle_dfl']* loss_angle_dfl)).detach()
 
     def preprocess(self, targets, batch_size, scale_tensor):
          #  [class_id,xmin,ymin,xmax,ymax,a1,a2,a3,a4,angle,c_x,c_y,box_w,box_h] 传入的label
          # targets 实际上是[num_of_target,14]
-        targets_list = np.zeros((batch_size, 1, 14)).tolist()
+        targets_list = np.zeros((batch_size, 1, 6)).tolist()
         for i, item in enumerate(targets.cpu().numpy().tolist()):
             targets_list[int(item[0])].append(item[1:])
         max_len = max((len(l) for l in targets_list))
         # 大概懂什么意思了，应该是每个batch 对应几张
-        targets = torch.from_numpy(np.array(list(map(lambda l:l + [[-1,0,0,0,0]]*(max_len - len(l)), targets_list)))[:,1:,:]).to(targets.device)
-        targets[..., 1:] = xywh2xyxy(batch_target)
+        targets = torch.from_numpy(np.array(list(map(lambda l:l + [[-1,0,0,0,0,0]]*(max_len - len(l)), targets_list)))[:,1:,:]).to(targets.device)
+        batch_target = targets[:,:,1:5].mul_(scale_tensor)
+        targets[...,1:] = batch_target
         return targets
-
+    def obb_decode(self, points, pred_dist, pred_angle, stride_tensor, mode="xyxy"):
+        if self.use_reg_dfl:
+            batch_size, n_anchors, _ = pred_dist.shape
+            pred_dist = F.softmax(pred_dist.view(batch_size, n_anchors, 4, self.reg_max + 1), dim=-1).matmul(self.reg_proj.to(pred_dist.device))
+        if self.use_angle_dfl:
+            batch_size, n_anchors, _ = pred_angle.shape
+            pred_angle = F.softmax(pred_angle.view(batch_size, n_anchors, 1, self.angle_max + 1), dim=-1).matmul(self.angle_proj.to(pred_angle.device))
+        # 将DFL的蒸馏去除
+        pred_dist = dist2bbox(pred_dist, points, box_format= mode) 
+        return pred_dist, pred_angle
+                 
     def bbox_decode(self, anchor_points, pred_dist):
         if self.use_dfl:
             batch_size, n_anchors, _ = pred_dist.shape
@@ -207,58 +229,82 @@ class VarifocalLoss(nn.Module):
         return loss
 
 
+
+
+
 class BboxLoss(nn.Module):
-    def __init__(self, num_classes, reg_max, use_dfl=False, iou_type='giou'):
+    def __init__(self, num_classes, reg_max, angle_max,use_reg_dfl=False, use_angle_dfl=False,iou_type='giou'):
         super(BboxLoss, self).__init__()
         self.num_classes = num_classes
-        self.iou_loss = IOUloss(box_format='xyxy', iou_type=iou_type, eps=1e-10)
+        self.iou_loss = ProbIoUloss()
         self.reg_max = reg_max
-        self.use_dfl = use_dfl
+        self.angle_max = angle_max
+        self.use_reg_dfl = use_reg_dfl
+        self.use_angle_dfl = use_angle_dfl
 
-    def forward(self, pred_dist, pred_bboxes, anchor_points,
-                target_bboxes, target_scores, target_scores_sum, fg_mask):
+    def forward(self, pred_angle_dist, pred_reg_dist,pred_bboxes,anchor_points,assigned_bboxes, assigned_scores,assigned_scores_sum,stride_tensor,\
+            fg_mask):
+        """
+            pred_angle:
+            pred_dist: 
+        """
 
         # select positive samples mask
         num_pos = fg_mask.sum()
         if num_pos > 0:
             # iou loss
-            bbox_mask = fg_mask.unsqueeze(-1).repeat([1, 1, 4])
-            pred_bboxes_pos = torch.masked_select(pred_bboxes,
-                                                  bbox_mask).reshape([-1, 4])
-            target_bboxes_pos = torch.masked_select(
-                target_bboxes, bbox_mask).reshape([-1, 4])
+            bbox_mask = fg_mask.unsqueeze(-1).repeat([1, 1, 5])
+            pred_bboxes_pos = torch.masked_select(pred_bboxes,\
+                                                  bbox_mask).reshape([-1, 5])
+            assigned_bboxes_pos = torch.masked_select(
+                assigned_bboxes, bbox_mask).reshape([-1, 5])
             bbox_weight = torch.masked_select(
-                target_scores.sum(-1), fg_mask).unsqueeze(-1)
+                assigned_scores.sum(-1), fg_mask).unsqueeze(-1)
             loss_iou = self.iou_loss(pred_bboxes_pos,
-                                     target_bboxes_pos) * bbox_weight
-            if target_scores_sum == 0:
+                                     assigned_bboxes_pos) * bbox_weight
+            if assigned_scores_sum == 0:
                 loss_iou = loss_iou.sum()
             else:
-                loss_iou = loss_iou.sum() / target_scores_sum
-               
-            # dfl loss
-            if self.use_dfl:
+                loss_iou = loss_iou.sum() / assigned_scores_sum
+            if self.use_angle_dfl:
+                angle_mask = fg_mask.unsqueeze(-1).repeat([1,1,self.angle_max+1])
+                pred_angle_pos = torch.masked_select(pred_angle_dist, angle_mask).reshape(
+                    [-1, self.angle_max + 1]
+                )
+                assigned_angle_pos = (
+                    assigned_bboxes_pos[:, 4] /
+                self.half_pi_bin).clip(0, self.angle_max - 0.01)
+                loss_angle_dfl = self._df_loss(pred_angle_pos, assigned_angle_pos)
+                if assigned_scores_sum == 0:
+                    loss_angle_dfl = loss_angle_dfl.sum()
+                else:
+                    loss_angle_dfl = loss_angle_dfl.sum() / assigned_scores_sum
+            else:
+                loss_angle_dfl = torch.Tensor(0.).to(pred_angle_dist.device)
+            if self.use_reg_dfl:
+                dfl_bboxes = assigned_bboxes[:,:4].clone()/stride_tensor
+                pred_t = pred_reg_dist
                 dist_mask = fg_mask.unsqueeze(-1).repeat(
                     [1, 1, (self.reg_max + 1) * 4])
                 pred_dist_pos = torch.masked_select(
-                    pred_dist, dist_mask).reshape([-1, 4, self.reg_max + 1])
-                target_ltrb = bbox2dist(anchor_points, target_bboxes, self.reg_max)
-                target_ltrb_pos = torch.masked_select(
-                    target_ltrb, bbox_mask).reshape([-1, 4])
-                loss_dfl = self._df_loss(pred_dist_pos,
-                                        target_ltrb_pos) * bbox_weight
-                if target_scores_sum == 0:
-                    loss_dfl = loss_dfl.sum()
+                    pred_t, dist_mask).reshape([-1, 4, self.reg_max + 1])
+                assigned_ltrb = bbox2dist(anchor_points, dfl_bboxes, self.reg_max)
+                assigned_ltrb_pos = torch.masked_select(
+                    assigned_ltrb, bbox_mask).reshape([-1, 4])
+                loss_reg_dfl = self._df_loss(pred_dist_pos,
+                                        assigned_ltrb_pos) * bbox_weight
+                if assigned_scores_sum == 0:
+                    loss_reg_dfl = loss_reg_dfl.sum()
                 else:
-                    loss_dfl = loss_dfl.sum() / target_scores_sum
+                    loss_reg_dfl = loss_reg_dfl.sum() / assigned_scores_sum
             else:
-                loss_dfl = pred_dist.sum() * 0.
-
+                loss_reg_dfl =  torch.tensor(0.).to(pred_reg_dist.device)
         else:
-            loss_iou = pred_dist.sum() * 0.
-            loss_dfl = pred_dist.sum() * 0.
+            loss_iou = torch.tensor(0.).to(pred_bboxes.device)
+            loss_reg_dfl = torch.tensor(0.).to(pred_reg_dist.device)
+            loss_angle_dfl = torch.tensor(0.).to(pred_angle_dist.device)
 
-        return loss_iou, loss_dfl
+        return loss_iou, loss_reg_dfl, loss_angle_dfl
 
     def _df_loss(self, pred_dist, target):
         target_left = target.to(torch.long)
