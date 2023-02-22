@@ -8,7 +8,7 @@ from yolov6_obb.utils.general import dist2bbox_OBB
 import ipdb
 import loguru
 class Detect_OBB(nn.Module):
-    def __init__(self, num_classes=15, anchors=1, num_layers=3, inplace=True, head_layers=None, use_dfl=True, reg_max=16, angle_max=90,trt=False,export_onnx=False):  # detection layer
+    def __init__(self, num_classes=15, anchors=1, num_layers=3, inplace=True, head_layers=None, use_reg_dfl=True, reg_max=16, use_angle_dfl=True,angle_max=90,trt=False,export_onnx=False):  # detection layer
         super().__init__()
         assert head_layers is not None
         self.nc = num_classes  # number of classes
@@ -24,18 +24,18 @@ class Detect_OBB(nn.Module):
         self.inplace = inplace
         stride = [8, 16, 32]  # strides computed during build
         self.stride = torch.tensor(stride)
-        self.use_dfl = use_dfl
+        self.use_reg_dfl = use_reg_dfl
         self.reg_max = reg_max
+        self.use_angle_dfl = use_angle_dfl
         self.angle_max = angle_max
-        self.proj_conv = nn.Conv2d(self.reg_max + 1, 1, 1, bias=False)
+        self.proj_reg = nn.Conv2d(self.reg_max + 1, 1, 1, bias=False)
         self.proj_angle = nn.Conv2d(self.angle_max + 1, 1, 1, bias=False )
         self.grid_cell_offset = 0.5
         self.grid_cell_size = 5.0 
-        self.half_pi = torch.to_tensor(
-            [1.5707963267948966], dtype=torch.float32)
+        self.half_pi = torch.tensor(
+            [1.5707963267948966],dtype=torch.float32)
         self.half_pi_bin = self.half_pi/self.angle_max
         # Model Deployment
-        trt =  False if torch.onnx.is_export() else trt
         # Init decouple head
         self.stems = nn.ModuleList()
         self.cls_convs = nn.ModuleList()
@@ -81,20 +81,20 @@ class Detect_OBB(nn.Module):
             conv.weight = torch.nn.Parameter(w, requires_grad=True)
 
         self.reg_para = nn.Parameter(torch.linspace(0, self.reg_max, self.reg_max + 1), requires_grad=False)
-        self.angle_para = nn.Parameter(torch.linspace(0, self.reg_max, self.reg_max + 1), requires_grad=False)
-        self.proj_reg.weight = nn.Parameter(self.proj_para.view([1, self.reg_max + 1, 1, 1]).clone().detach(),
+        self.angle_para = nn.Parameter(torch.linspace(0, self.angle_max, self.angle_max + 1), requires_grad=False)
+        self.proj_reg.weight = nn.Parameter(self.reg_para.view([1, self.reg_max + 1, 1, 1]).clone().detach(),
                                                    requires_grad=False)
-        self.proj_angle.weight = nn.Parameter(self.angle_para.view([1, self.reg_max + 1, 1, 1]).clone().detach(),
+        self.proj_angle.weight = nn.Parameter(self.angle_para.view([1, self.angle_max + 1, 1, 1]).clone().detach(),
                                                    requires_grad=False)
     
-    def obb_decode(self, points, pred_dist, pred_angle, stride_tensor):
-        b,l = pred_angle.shape[:2]
-        xy,wh = torch.split(pred_dist, 2, axis = -1)
-        xy = xy*stride_tensor + points
-        wh = (F.elu(wh)+1.)*stride_tensor
-        if self.use_angle_dfl:
-            angle = F.softmax(pred_angle,l,1,self.angle_max+1).matmul(self.angle_proj)
-        return torch.concat([xy, wh, angle])
+    # def obb_decode(self, points, pred_dist, pred_angle, stride_tensor):
+    #     b,l = pred_angle.shape[:2]
+    #     xy,wh = torch.split(pred_dist, 2, axis = -1)
+    #     xy = xy*stride_tensor + points
+    #     wh = (F.elu(wh)+1.)*stride_tensor
+    #     if self.use_angle_dfl:
+    #         angle = F.softmax(pred_angle,l,1,self.angle_max+1).matmul(self.angle_proj)
+    #     return torch.concat([xy, wh, angle])
     def forward(self,x):
         if self.training:
             cls_score_list = []
@@ -111,13 +111,19 @@ class Detect_OBB(nn.Module):
                 reg_output = self.reg_preds[i](reg_feat)
                 ori_feat = self.ori_convs[i](ori_x)
                 ori_output = self.ori_preds[i](ori_feat)
-                cls_output = F.sigmoid(cls_output)
+                cls_output = torch.sigmoid(cls_output)
                 cls_score_list.append(cls_output.flatten(2).permute((0, 2, 1)))               
                 reg_dist_list.append(reg_output.flatten(2).permute((0, 2, 1)))
                 ori_dist_list.append(ori_output.flatten(2).permute((0, 2, 1)))
-            return x,cls_score_list,reg_dist_list,ori_dist_list
+            cls_score_list = torch.cat(cls_score_list,axis=1)
+            reg_dist_list = torch.cat(reg_dist_list,axis=1)
+            ori_dist_list = torch.cat(ori_dist_list,axis=1)
+            if(torch.onnx.is_in_onnx_export()):
+                return cls_score_list, reg_dist_list, ori_dist_list
+            else:
+                return x,cls_score_list,reg_dist_list,ori_dist_list
         else:
-            anchor_points, stride_tensor, num_anchors_list = generate_anchors_OBB(
+            anchor_points, stride_tensor  = generate_anchors_OBB(
                 x, self.stride, self.grid_cell_size, self.grid_cell_offset, device=x[0].device, is_eval=True)
             cls_score_list = []
             reg_dist_list = []
@@ -136,15 +142,22 @@ class Detect_OBB(nn.Module):
                 ori_feat = self.ori_convs[i](ori_x)
                 ori_output = self.ori_preds[i](ori_feat)
                 if self.use_reg_dfl:
+                    from loguru import logger
+                    logger.info(reg_output.shape)
+                    logger.info(self.reg_max)
                     reg_output = reg_output.reshape([-1, 4, self.reg_max + 1, l]).permute(0, 2, 1, 3)
-                    reg_output = self.reg_conv(F.softmax(reg_output, dim=1))
+                    reg_output = self.proj_reg(F.softmax(reg_output, dim=1))
+                    logger.info(reg_output.shape)
                 if self.use_angle_dfl:
+                    logger.info(ori_output.shape)
+                    logger.info(self.angle_max)
                     ori_output = ori_output.reshape([-1, 1, self.angle_max + 1,l]).permute(0, 2, 1, 3)
-                    ori_output = self.angle_conv(F.softmax(ori_output, dim=1))
+                    ori_output = self.proj_angle(F.softmax(ori_output, dim=1))
+                    logger.info(ori_output.shape)
                 cls_output = torch.sigmoid(cls_output)
                 cls_score_list.append(cls_output.reshape([b, self.nc, l]))
                 reg_dist_list.append(reg_output.reshape([b, 4, l]))
-                ori_dist_list.append(reg_output.reshape([b, 1, l]))
+                ori_dist_list.append(ori_output.reshape([b, 1, l]))
                 
             cls_score_list = torch.cat(cls_score_list, axis=-1).permute(0, 2, 1)
             reg_dist_list = torch.cat(reg_dist_list, axis=-1).permute(0, 2, 1)
@@ -238,7 +251,7 @@ def build_effidehead_layer_OBB(channels_list, num_anchors, num_classes, reg_max=
         # cls_pred1
         nn.Conv2d(
             in_channels=channels_list[8],
-            out_channels=num_classes * num_anchors,
+            out_channels= num_classes * num_anchors,
             kernel_size=1
         ),
         # reg_pred1

@@ -8,7 +8,8 @@ from yolov6_obb.layers.common import *
 from yolov6_obb.utils.torch_utils import initialize_weights
 from yolov6_obb.models.efficientrep import *
 from yolov6_obb.models.reppan import *
-from yolov6_obb.models.effidehead_obb import Detect, build_effidehead_layer
+from yolov6_obb.models.effidehead_obb_5 import Detect_OBB, build_effidehead_layer_OBB
+# from yolov6_obb.models.effidehead_obb import Detect, build_effidehead_layer
 
 
 class Model(nn.Module):
@@ -42,6 +43,7 @@ class Model(nn.Module):
             featmaps = []
             featmaps.extend(x)
         x = self.detect(x)
+        
 
         # x neck 之后的卷积
       #  fpn_feature, cls_score_list, reg_distri_list = x
@@ -71,8 +73,10 @@ def build_network(config, channels, num_classes, anchors, num_layers):
     num_repeat_neck = config.model.neck.num_repeats
     channels_list_neck = config.model.neck.out_channels
     num_anchors = config.model.head.anchors
-    use_dfl = config.model.head.use_dfl
+    use_reg_dfl = config.model.head.use_reg_dfl
     reg_max = config.model.head.reg_max
+    use_angle_dfl = config.model.head.use_angle_dfl
+    angle_max = config.model.head.angle_max
     num_repeat = [(max(round(i * depth_mul), 1) if i > 1 else i) for i in (num_repeat_backbone + num_repeat_neck)]
     channels_list = [make_divisible(i * width_mul, 8) for i in (channels_list_backbone + channels_list_neck)]
 
@@ -108,10 +112,10 @@ def build_network(config, channels, num_classes, anchors, num_layers):
             num_repeats=num_repeat,
             block=block
         )
+    
+    head_layers = build_effidehead_layer_OBB(channels_list,num_anchors,num_classes,reg_max=reg_max,angle_max=angle_max)
 
-    head_layers = build_effidehead_layer(channels_list, num_anchors, num_classes, reg_max)
-
-    head = Detect(num_classes, anchors, num_layers, head_layers=head_layers, use_dfl=use_dfl)
+    head = Detect_OBB(num_classes, anchors, num_layers, head_layers=head_layers, use_reg_dfl=use_reg_dfl,use_angle_dfl=use_angle_dfl,reg_max=reg_max,angle_max=angle_max)
 
     return backbone, neck, head
 
