@@ -2,18 +2,20 @@ import torch
 import torch.nn as nn  
 import torch.nn.functional as F  
 import mmcv.ops.box_iou_rotated as box_iou_rotated
-import yolov6_obb.utils.obb_utils.rotated_iou_similarity as rotated_iou_similarity
-import yolov6_obb.utils.obb_utils.check_point_in_rotated_boxes as check_point_in_rotated_boxes
+from yolov6_obb.utils.obb_utils import rotated_iou_similarity
+from yolov6_obb.utils.obb_utils import check_point_in_rotated_boxes
 from yolov6_obb.assigners.assigner_utils import select_highest_overlaps
+import ipdb
 class RotatedTaskAlignedAssigner(nn.Module):
-    def __init__(self, topk=13, alpha=1.0, beta=6.0, eps=1e-9):
+    def __init__(self, topk=13, alpha=1.0, beta=6.0, eps=1e-9, num_classes=4):
         super(RotatedTaskAlignedAssigner, self).__init__()
         self.topk = topk
         self.alpha = alpha
         self.beta = beta
         self.eps = eps
+        self.num_classes = num_classes
     @torch.no_grad()
-    def forward(self, pred_scores, pred_bboxes, anchor_points, num_anchor_list, gt_labels,gt_bboxes, mask_gt):
+    def forward(self, pred_scores, pred_bboxes, anchor_points, gt_labels,gt_bboxes, mask_gt):
         """
         The assignment is done in following steps
             1. compute alignment metric between all bbox (bbox of all pyramid levels) and gt
@@ -36,7 +38,10 @@ class RotatedTaskAlignedAssigner(nn.Module):
             assigned_labels (Tensor): (B, L)
             assigned_bboxes (Tensor): (B, L, 5)
             assigned_scores (Tensor): (B, L, C)
+            fg_mask bool
         """
+        self.bs = pred_scores.shape[0]
+        self.n_max_boxes = gt_bboxes.size(1)
         assert pred_scores.ndim == pred_bboxes.ndim
         assert gt_labels.ndim == gt_bboxes.ndim and \
                gt_bboxes.ndim == 3
@@ -61,6 +66,7 @@ class RotatedTaskAlignedAssigner(nn.Module):
         pos_overlaps = (overlaps * mask_pos).max(axis=-1, keepdim=True)[0]
         norm_align_metric = (align_metric * pos_overlaps / (pos_align_metrics + self.eps)).max(-2)[0].unsqueeze(-1)
         target_scores = target_scores * norm_align_metric
+
         return target_labels, target_bboxes, target_scores, fg_mask.bool()
     def get_pos_mask(self,
                      pred_scores,
@@ -69,6 +75,7 @@ class RotatedTaskAlignedAssigner(nn.Module):
                      gt_bboxes,
                      anchor_points,
                      mask_gt):
+  
         align_metric, overlaps = self.get_box_metrics(pred_scores, pred_bboxes, gt_labels, gt_bboxes)
          # check the positive sample's center in gt, [B, n, L]
         mask_in_gts = check_point_in_rotated_boxes(anchor_points, gt_bboxes)
@@ -110,3 +117,24 @@ class RotatedTaskAlignedAssigner(nn.Module):
                                         torch.full_like(target_scores, 0))
 
         return target_labels, target_bboxes, target_scores
+    def select_topk_candidates(self,
+                               metrics,
+                               largest=True,
+                               topk_mask=None):
+        # metrics [bs,max_len,num_anchors]
+        # topkmask [bs,max_len,topk]
+        num_anchors = metrics.shape[-1]
+        topk_metrics, topk_idxs = torch.topk(
+            metrics, self.topk, axis=-1, largest=largest)
+        # 更改成对应的[bs,max_len,topk]
+        if topk_mask is None:
+            topk_mask = (topk_metrics.max(axis=-1, keepdim=True) > self.eps).tile(
+                [1, 1, self.topk])
+        topk_idxs = torch.where(topk_mask, topk_idxs, torch.zeros_like(topk_idxs))
+        # 根据mask 更新一下 topk_idex
+        is_in_topk = F.one_hot(topk_idxs, num_anchors).sum(axis=-2)
+        # one-hot 编码转换到[bs,max_len,num_anchors]
+        # 转换成[bs,num_anchors],这个直接赋值0
+        is_in_topk = torch.where(is_in_topk > 1,
+            torch.zeros_like(is_in_topk), is_in_topk)
+        return is_in_topk.to(metrics.dtype)
