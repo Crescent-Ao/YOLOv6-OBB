@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from yolov6_obb.assigners.iou2d_calculator import iou2d_calculator
 from yolov6_obb.assigners.assigner_utils import dist_calculator, select_candidates_in_gts, select_highest_overlaps, iou_calculator
-
+import ipdb
 class ATSSAssigner(nn.Module):
     '''Adaptive Training Sample Selection Assigner'''
     def __init__(self,
@@ -20,8 +20,9 @@ class ATSSAssigner(nn.Module):
                 n_level_bboxes,
                 gt_labels,
                 gt_bboxes,
+                gt_obb,
                 mask_gt,
-                pd_bboxes):
+                pd_bboxes=None):
         r"""This code is based on
             https://github.com/fcjian/TOOD/blob/master/mmdet/core/bbox/assigners/atss_assigner.py
 
@@ -49,7 +50,7 @@ class ATSSAssigner(nn.Module):
                    torch.zeros([self.bs, self.n_anchors, self.num_classes]).to(device), \
                    torch.zeros([self.bs, self.n_anchors]).to(device)
 
-
+        ipdb.set_trace()
         overlaps = iou2d_calculator(gt_bboxes.reshape([-1, 4]), anc_bboxes)
         overlaps = overlaps.reshape([self.bs, -1, self.n_anchors])
 
@@ -75,7 +76,7 @@ class ATSSAssigner(nn.Module):
 
         # assigned target 接下俩进行样本的分配任务
         target_labels, target_bboxes, target_scores = self.get_targets(
-            gt_labels, gt_bboxes, target_gt_idx, fg_mask)
+            gt_labels, gt_obb, target_gt_idx, fg_mask)
 
         # soft label with iou
         if pd_bboxes is not None:
@@ -156,8 +157,8 @@ class ATSSAssigner(nn.Module):
             target_labels, torch.full_like(target_labels, self.bg_idx))
 
         # assigned target boxes
-        target_bboxes = gt_bboxes.reshape([-1, 4])[target_gt_idx.flatten()]
-        target_bboxes = target_bboxes.reshape([self.bs, self.n_anchors, 4])
+        target_bboxes = gt_bboxes.reshape([-1, 5])[target_gt_idx.flatten()]
+        target_bboxes = target_bboxes.reshape([self.bs, self.n_anchors, 5])
 
         # assigned target scores
         target_scores = F.one_hot(target_labels.long(), self.num_classes + 1).float()

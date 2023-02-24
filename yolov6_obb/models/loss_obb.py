@@ -38,7 +38,7 @@ class ComputeLoss:
         self.grid_cell_offset = grid_cell_offset
         self.num_classes = num_classes
         self.ori_img_size = ori_img_size
-        self.warmup_epoch = -1
+        self.warmup_epoch = warmup_epoch
         self.warmup_assigner = ATSSAssigner(9, num_classes=self.num_classes)
         self.formal_assigner = RotatedTaskAlignedAssigner(topk=13, num_classes=self.num_classes, alpha=1.0, beta=6.0)
         
@@ -81,8 +81,9 @@ class ComputeLoss:
         targets = self.preprocess(targets, batch_size, gt_bboxes_scale)
         gt_labels = targets[:, :, :1]
         gt_bboxes = targets[:, :, 1:] # x y w h theta
-        mask_gt = (gt_bboxes.sum(-1, keepdim=True) > 0).float()
-        # pboxes
+        gt_bboxes_atss = xywh2xyxy(gt_bboxes[:,:,:-1])
+        mask_gt = (gt_bboxes[:,:,:-2].sum(-1, keepdim=True) > 0).float()
+        ipdb.set_trace()
         anchor_points_s = anchor_points/stride_tensor
         pred_reg_atss, pred_angle = self.obb_decode(anchor_points_s, pred_reg_dist,\
                 pred_angle_dist,stride_tensor,mode="xyxy")
@@ -97,9 +98,10 @@ class ComputeLoss:
                         anchors,
                         n_anchors_list,
                         gt_labels,
-                        gt_bboxes[:,:,:-1],
+                        gt_bboxes_atss,
+                        gt_bboxes,
                         mask_gt,
-                        pred_reg_atss.detach() * stride_tensor)
+                        None)
             else:
                 target_labels, target_bboxes, target_scores, fg_mask = \
                     self.formal_assigner(
@@ -162,7 +164,7 @@ class ComputeLoss:
         if step_num % 10 == 0:
             torch.cuda.empty_cache()
 
-        # rescale bbox
+        # TODO rescale bbox 这个目前先不需要进行rescale操作，DFL loss会加上这么一个东西
         target_bboxes /= stride_tensor
         
         # cls loss
@@ -213,7 +215,7 @@ class ComputeLoss:
             targets_list[int(item[0])].append(item[1:])
         max_len = max((len(l) for l in targets_list))
         targets = torch.from_numpy(np.array(list(map(lambda l:l + [[-1,0,0,0,0,0]]*(max_len - len(l)), targets_list)))[:,1:,:]).to(targets.device)
-        batch_target = targets[:,:,1:5].mul_(scale_tensor)
+        batch_target = targets[:,:,1:5]
         targets[...,1:5] = batch_target
         targets = targets.float()
         return targets
@@ -260,13 +262,15 @@ class BboxLoss(nn.Module):
         self.angle_max = angle_max
         self.use_reg_dfl = use_reg_dfl
         self.use_angle_dfl = use_angle_dfl
-
     def forward(self, pred_angle_dist, pred_reg_dist,pred_bboxes,anchor_points,assigned_bboxes, assigned_scores,assigned_scores_sum,stride_tensor,\
             fg_mask):
         """
             pred_angle:
             pred_dist: 
         """
+        self.half_pi = torch.tensor(
+            [1.5707963267948966],dtype=torch.float32).to(pred_angle_dist.device)
+        self.half_pi_bin = self.half_pi/self.angle_max
 
         # select positive samples mask
         num_pos = fg_mask.sum()
@@ -281,6 +285,7 @@ class BboxLoss(nn.Module):
                 assigned_scores.sum(-1), fg_mask).unsqueeze(-1)
             loss_iou = self.iou_loss(pred_bboxes_pos,
                                      assigned_bboxes_pos) * bbox_weight
+            ipdb.set_trace()
             if assigned_scores_sum == 0:
                 loss_iou = loss_iou.sum()
             else:
@@ -301,7 +306,8 @@ class BboxLoss(nn.Module):
             else:
                 loss_angle_dfl = torch.Tensor(0.).to(pred_angle_dist.device)
             if self.use_reg_dfl:
-                dfl_bboxes = assigned_bboxes[:,:4].clone()/stride_tensor
+                bbox_dfl_mask = fg_mask.unsqueeze(-1).repeat([1, 1, 4])
+                dfl_bboxes = assigned_bboxes[:,:,:4].clone()/stride_tensor
                 pred_t = pred_reg_dist
                 dist_mask = fg_mask.unsqueeze(-1).repeat(
                     [1, 1, (self.reg_max + 1) * 4])
@@ -309,7 +315,7 @@ class BboxLoss(nn.Module):
                     pred_t, dist_mask).reshape([-1, 4, self.reg_max + 1])
                 assigned_ltrb = bbox2dist(anchor_points, dfl_bboxes, self.reg_max)
                 assigned_ltrb_pos = torch.masked_select(
-                    assigned_ltrb, bbox_mask).reshape([-1, 4])
+                    assigned_ltrb, bbox_dfl_mask).reshape([-1, 4])
                 loss_reg_dfl = self._df_loss_reg(pred_dist_pos,
                                         assigned_ltrb_pos) * bbox_weight
                 if assigned_scores_sum == 0:
