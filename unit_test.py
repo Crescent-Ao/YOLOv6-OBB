@@ -19,8 +19,10 @@ from yolov6_obb.utils.envs import get_envs, select_device, set_random_seed
 from yolov6_obb.data.datasets import *
 from yolov6_obb.data.data_load import *
 from yolov6_obb.utils.obb_utils import obb_vis
+from yolov6_obb.models.loss_obb import ComputeLoss
 from tqdm import tqdm
 import torch.distributed as dist
+from torch.cuda import amp
 ROOT = os.getcwd()
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
@@ -34,17 +36,18 @@ def make_args():
     parser.add_argument('--simplify', action='store_true', help='simplify onnx model')
     parser.add_argument('--dynamic-batch', action='store_true', help='export dynamic batch onnx model')
     parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--config', default='/home/crescent/YOLOv6-OBB/configs/repopt/yolov6s_opt.py',help='Model configuration')
+    parser.add_argument('--config', default='/home/crescent/YOLOv6-OBB/configs/repopt/yolov6_tiny_opt.py',help='Model configuration')
     parser.add_argument('--img_size', default=640,help = 'Dataloader img size')
     parser.add_argument('--anno_file_name', default='/home/crescent/YOLOv6-OBB/train_DroneVehicle.txt')
     parser.add_argument('--dist_url', default='env://', type=str, help='url used to set up distributed training')
     parser.add_argument('--gpu_count', type=int, default=0)
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter')
     parser.add_argument('--workers', default=8, type=int, help='number of data loading workers (default: 8)')
+    parser.add_argument("--epochs", default=20, type=int, help="epochs")
     args = parser.parse_args()
     return args
 
-def model_dataloader(args,visualize=True):
+def model_dataloader(args,visualize=False):
     args.rank, args.local_rank, args.world_size = get_envs()
     logger.info("The unit test dataset and dataloader")
     master_process = args.rank == 0 if args.world_size > 1 else args.rank == -1
@@ -74,7 +77,7 @@ def model_dataloader(args,visualize=True):
 ):
     """
     train_loader = create_dataloader(args.anno_file_name, args.img_size[0], args.batch_size,
-                                     args.local_rank,args.workers,shuffle=True)[0]
+                                     args.local_rank,args.workers,shuffle=False)[0]
    
     if visualize:
         img, bboxes = iter(train_loader).__next__()
@@ -93,8 +96,150 @@ def model_dataloader(args,visualize=True):
             The bboxes shape{bboxes.shape}")
         
         
+def label_assigner_loss_test(args):
+    logger.info("The unit test of label assigner and loss calculation")
+    #打出对应的log 计算
+    cuda = args.device != 'cpu' and torch.cuda.is_available()
+    device = torch.device(f'cuda:{args.device}' if cuda else "cpu")
+    cfg = Config.fromfile(args.config)
+    # 半精度仅仅针对GPU设备进行处理
+    model = build_model(cfg, num_classes=5, device=device)
+    # VisDrone DataSet
+    train_loader = create_dataloader(args.anno_file_name, args.img_size[0], args.batch_size,
+                                     args.local_rank,args.workers,shuffle=False)[0]
+    model.train() #切换到训练模型是
+    compute_loss = ComputeLoss(num_classes=5,
+                                        ori_img_size=args.img_size[0],
+                                        use_reg_dfl=cfg.model.head.use_reg_dfl,
+                                        reg_max= cfg.model.head.reg_max,
+                                        use_angle_dfl=cfg.model.head.use_angle_dfl,
+                                        angle_max= cfg.model.head.angle_max,
+                                        iou_type=cfg.model.head.iou_type)
+    pbar = enumerate(train_loader)
+    optimizer = get_optimizer(args,cfg,model)
+    scheduler, lf = get_lr_scheduler(args,cfg,optimizer)
+    last_opt_step = -1
+    scaler = amp.GradScaler(enabled=args.device != 'cpu')
+    max_stepnum = len(train_loader)
+    warmup_stepnum = max(round(cfg.solver.warmup_epochs * max_stepnum),1000)
+    loss_num = 4
     
- 
+    print(len(train_loader))
+    for epoch_num in range(args.epochs):
+        logger.info(f"The current epoch is{epoch_num}")
+        if(epoch_num>=0):
+            scheduler.step()
+            ipdb.set_trace()
+        optimizer.zero_grad()
+        mean_loss = torch.zeros(loss_num, device=device)
+        pbar = enumerate(train_loader)
+        for step_num, batch_data in pbar:
+            images, targets = prepro_data(batch_data, device)
+            with amp.autocast(enabled=args.device != 'cpu'):
+                preds, s_feature_maps = model(images)
+                total_loss, loss_items = compute_loss(preds, targets, epoch_num, step_num)
+            mean_loss = (mean_loss*step_num+loss_items)/(step_num+1)
+            if(step_num%50==0):
+                logger.info(('%10s' + '%10.4g' * loss_num) % (f'{epoch_num}/{args.epochs - 1}', \
+                                                                *(mean_loss)))
+            scaler.scale(total_loss).backward()
+            curr_step = step_num + max_stepnum * epoch_num
+            accumulate = max(1, round(64/args.batch_size))
+    
+            if curr_step <= warmup_stepnum:
+                    accumulate = max(1, np.interp(curr_step, [0, warmup_stepnum], [1, 64 / args.batch_size]).round())
+                    for k, param in enumerate(optimizer.param_groups):
+                        warmup_bias_lr = cfg.solver.warmup_bias_lr if k == 2 else 0.0
+                        param['lr'] = np.interp(curr_step, [0, warmup_stepnum], [warmup_bias_lr, param['initial_lr'] * lf(epoch_num)])
+                        if 'momentum' in param:
+                            param['momentum'] = np.interp(curr_step, [0, warmup_stepnum], [cfg.solver.warmup_momentum, cfg.solver.momentum])
+            if curr_step - last_opt_step >= accumulate:
+                    scaler.step(optimizer)
+                    scaler.update()
+                    optimizer.zero_grad()
+                    last_opt_step = curr_step
+            last_opt_step = curr_step
+        logger.info(f"{total_loss}")
+
+def prepro_data(batch_data, device):
+    images = batch_data[0].float().to(device, non_blocking=True)
+    targets = batch_data[1].float().to(device)
+    return images, targets
+def get_optimizer(args, cfg, model):
+    accumulate = max(1, round(64 / args.batch_size))
+    cfg.solver.weight_decay *= args.batch_size * accumulate / 64
+    optimizer = build_optimizer(cfg, model)
+    return optimizer
+def build_optimizer(cfg, model):
+    """ Build optimizer from cfg file."""
+    g_bnw, g_w, g_b = [], [], []
+    for v in model.modules():
+        if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
+            g_b.append(v.bias)
+        if isinstance(v, nn.BatchNorm2d):
+            g_bnw.append(v.weight)
+        elif hasattr(v, 'weight') and isinstance(v.weight, nn.Parameter):
+            g_w.append(v.weight)
+
+    assert cfg.solver.optim == 'SGD' or 'Adam', 'ERROR: unknown optimizer, use SGD defaulted'
+    if cfg.solver.optim == 'SGD':
+        optimizer = torch.optim.SGD(g_bnw, lr=cfg.solver.lr0, momentum=cfg.solver.momentum, nesterov=True)
+    elif cfg.solver.optim == 'Adam':
+        optimizer = torch.optim.Adam(g_bnw, lr=cfg.solver.lr0, betas=(cfg.solver.momentum, 0.999))
+
+    optimizer.add_param_group({'params': g_w, 'weight_decay': cfg.solver.weight_decay})
+    optimizer.add_param_group({'params': g_b})
+
+    del g_bnw, g_w, g_b
+    return optimizer
+def get_lr_scheduler(args, cfg, optimizer):
+        epochs = args.epochs
+        lr_scheduler, lf = build_lr_scheduler(cfg, optimizer, epochs)
+        return lr_scheduler, lf
+def build_lr_scheduler(cfg, optimizer, epochs):
+    """Build learning rate scheduler from cfg file."""
+    if cfg.solver.lr_scheduler == 'Cosine':
+        lf = lambda x: ((1 - math.cos(x * math.pi / epochs)) / 2) * (cfg.solver.lrf - 1) + 1
+    elif cfg.solver.lr_scheduler == 'Constant':
+        lf = lambda x: 1.0
+    else:
+        logger.error('unknown lr scheduler, use Cosine defaulted')
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
+    return scheduler, lf
+def update_optimizer(step,max_stepnum,epoch,optimizer,args,lf,cfg,scaler,warmup_stepnum,last_opt_step):
+    curr_step = step + max_stepnum * epoch
+    accumulate = max(1, round(64/args.batch_size))
+    
+    if curr_step <= warmup_stepnum:
+            accumulate = max(1, np.interp(curr_step, [0, warmup_stepnum], [1, 64 / args.batch_size]).round())
+            for k, param in enumerate(optimizer.param_groups):
+                warmup_bias_lr = cfg.solver.warmup_bias_lr if k == 2 else 0.0
+                param['lr'] = np.interp(curr_step, [0, warmup_stepnum], [warmup_bias_lr, param['initial_lr'] * lf(epoch)])
+                if 'momentum' in param:
+                    param['momentum'] = np.interp(curr_step, [0, warmup_stepnum], [cfg.solver.warmup_momentum, cfg.solver.momentum])
+    if curr_step - last_opt_step >= accumulate:
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+            last_opt_step = curr_step
+    return last_opt_step
+class AverageMeter(object):
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
 def model_adaptation(args):
     logger.info("The unit test model adaption")
     cuda = args.device != 'cpu' and torch.cuda.is_available()
@@ -108,9 +253,10 @@ def model_adaptation(args):
     img = torch.zeros(args.batch_size,3,*args.img_size).to(device)
     if args.half:
         img, model = img.half(),model.half()
-    model.train()
-    x,feature_map = model(img)
-    ipdb.set_trace()
+    model.eval()
+    # return x if export_mode is True else [x, featmaps]
+    x = model(img)
+    
     logger.info("\n Starting to export onnx")
     export_file = '/home/crescent/YOLOv6-OBB/demo.onnx'
     with BytesIO() as f:
@@ -118,7 +264,7 @@ def model_adaptation(args):
                           training = torch.onnx.TrainingMode.EVAL,
                           do_constant_folding=True,
                           input_names=['images'],
-                          output_names=['feature_map']
+                          output_names=['cls_score','reg_dist'],
                           )
         f.seek(0)
         onnx_model = onnx.load(f)
@@ -129,5 +275,5 @@ def model_adaptation(args):
     
 if __name__ == "__main__":
     args = make_args()
-    model_dataloader(args)
+    label_assigner_loss_test(args)
             

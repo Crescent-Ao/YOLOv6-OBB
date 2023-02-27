@@ -83,14 +83,13 @@ class ComputeLoss:
         gt_bboxes = targets[:, :, 1:] # x y w h theta
         gt_bboxes_atss = xywh2xyxy(gt_bboxes[:,:,:-1])
         mask_gt = (gt_bboxes[:,:,:-2].sum(-1, keepdim=True) > 0).float()
-        ipdb.set_trace()
         anchor_points_s = anchor_points/stride_tensor
         pred_reg_atss, pred_angle = self.obb_decode(anchor_points_s, pred_reg_dist,\
                 pred_angle_dist,stride_tensor,mode="xyxy")
-        pred_reg_tal, pred_angle = self.obb_decode(anchor_points_s, pred_reg_dist,\
+        pred_reg_tal, pred_angle = self.obb_decode(anchor_points, pred_reg_dist,\
                 pred_angle_dist,stride_tensor,mode="xywh")
       
-        pred_bboxes = torch.concat([pred_reg_tal*stride_tensor,pred_angle],dim=-1)
+        pred_bboxes = torch.concat([pred_reg_tal.clone()*stride_tensor,pred_angle],dim=-1)
         try:
             if epoch_num < self.warmup_epoch:
                 target_labels, target_bboxes, target_scores, fg_mask = \
@@ -101,7 +100,7 @@ class ComputeLoss:
                         gt_bboxes_atss,
                         gt_bboxes,
                         mask_gt,
-                        None)
+                        pred_reg_atss.detach()*stride_tensor)
             else:
                 target_labels, target_bboxes, target_scores, fg_mask = \
                     self.formal_assigner(
@@ -150,7 +149,7 @@ class ComputeLoss:
                 target_labels, target_bboxes, target_scores, fg_mask = \
                     self.formal_assigner(
                         _pred_scores,
-                        torch.cat([_pred_reg_tal*_stride_tensor, _pred_angle]),
+                        torch.cat([_pred_reg_tal*_stride_tensor, _pred_angle],dim=-1),
                         _anchor_points,
                         _gt_labels,
                         _gt_bboxes,
@@ -165,8 +164,7 @@ class ComputeLoss:
             torch.cuda.empty_cache()
 
         # TODO rescale bbox 这个目前先不需要进行rescale操作，DFL loss会加上这么一个东西
-        target_bboxes /= stride_tensor
-        
+      #  target_bboxes /= stride_tensor
         # cls loss
         target_labels = torch.where(fg_mask > 0, target_labels, torch.full_like(target_labels, self.num_classes))
         one_hot_label = F.one_hot(target_labels.long(), self.num_classes + 1)[..., :-1]
@@ -194,10 +192,7 @@ class ComputeLoss:
         """
         loss_iou, loss_reg_dfl, loss_angle_dfl = self.bbox_loss(pred_angle_dist,pred_reg_dist,pred_bboxes,anchor_points_s, target_bboxes,target_scores,\
             target_scores_sum,stride_tensor,fg_mask)
-        logger.info("loss iou", loss_iou)
-        logger.info("loss cls", loss_cls)
-        print(loss_iou)
-        print(loss_cls)
+        
         loss = self.loss_weight['class'] * loss_cls + \
                self.loss_weight['iou'] * loss_iou + \
                self.loss_weight['reg_dfl'] * loss_reg_dfl +\
@@ -214,7 +209,7 @@ class ComputeLoss:
         for i, item in enumerate(targets.cpu().numpy().tolist()):
             targets_list[int(item[0])].append(item[1:])
         max_len = max((len(l) for l in targets_list))
-        targets = torch.from_numpy(np.array(list(map(lambda l:l + [[-1,0,0,0,0,0]]*(max_len - len(l)), targets_list)))[:,1:,:]).to(targets.device)
+        targets = torch.from_numpy(np.array(list(map(lambda l:l + [[0,0,0,0,0,0]]*(max_len - len(l)), targets_list)))[:,1:,:]).to(targets.device)
         batch_target = targets[:,:,1:5]
         targets[...,1:5] = batch_target
         targets = targets.float()
@@ -276,6 +271,7 @@ class BboxLoss(nn.Module):
         num_pos = fg_mask.sum()
         if num_pos > 0:
             # iou loss
+            ipdb.set_trace()
             bbox_mask = fg_mask.unsqueeze(-1).repeat([1, 1, 5])
             pred_bboxes_pos = torch.masked_select(pred_bboxes,\
                                                   bbox_mask).reshape([-1, 5])
@@ -285,7 +281,6 @@ class BboxLoss(nn.Module):
                 assigned_scores.sum(-1), fg_mask).unsqueeze(-1)
             loss_iou = self.iou_loss(pred_bboxes_pos,
                                      assigned_bboxes_pos) * bbox_weight
-            ipdb.set_trace()
             if assigned_scores_sum == 0:
                 loss_iou = loss_iou.sum()
             else:
