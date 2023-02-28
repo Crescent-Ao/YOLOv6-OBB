@@ -3,11 +3,14 @@ import torch
 import numpy as np
 import os
 import mmcv.ops.box_iou_rotated as rotate_iou
+import ipdb
+from yolov6_obb.models.rbox_utils import rbox2poly_np
 def check_point_in_rotated_boxes(points, boxes):
       # [B, N, 5] -> [B, N, 4, 2]
-    polys = obb2poly(boxes)
+    b,l,_ = boxes.shape
+    polys = obb2poly(boxes).reshape(b,l,4,2)
     points = points.unsqueeze(0)
-    a, b, c, d = polys.split(4, axis=2)
+    a, b, c, d = torch.split(polys,[1,1,1,1],dim=2)
     ab = b - a
     ad = d - a
     ap = points - a
@@ -34,7 +37,7 @@ def rotated_iou_similarity(box1,box2):
     rotated_ious = []
     for b1, b2 in zip(box1, box2):
         rotated_ious.append(rotate_iou(b1, b2))
-    return torch.stack(rotate_iou,axis=0)
+    return torch.stack(rotated_ious,axis=0)
     
 def box2corner(box):
       """convert box coordinate to corners
@@ -46,7 +49,6 @@ def box2corner(box):
     
 def poly2obb_np(rbox:list):
     if rbox.shape[-1] == 9:
-        print("")
         res = np.empty((*rbox.shape[:-1], 6))
         res[..., 5] = rbox[..., 8]
         rbox = rbox[..., :8].reshape(1, -1, 2).astype(np.float32)
@@ -55,12 +57,17 @@ def poly2obb_np(rbox:list):
         rbox = rbox.reshape(1, -1, 2).astype(np.float32) 
     else:
         raise NotImplementedError(" less than 8 which is not implemented")
+    from loguru import logger
     (x, y), (w, h), angle = cv2.minAreaRect(rbox)
+    logger.info("The origininal cv2.minrect")
+    logger.info(f"x {x}y {y}w {w}h {h} theta {angle}")
     if w >= h:
         angle = -angle
     else:
         w, h = h, w
         angle = -90 - angle
+    logger.info("The output cv2.minrect")
+    logger.info(f"x {x}y {y}w {w}h {h} theta {angle}")
     theta = angle / 180 * np.pi
     res[..., 0] = x 
     res[..., 1] = y
@@ -94,16 +101,16 @@ def obb2poly(obboxes):
         [point1, point2, point3, point4], dim=-1)
 def obb_vis(img:np.ndarray, rboxes:torch.Tensor):
     cv2.imwrite(os.path.join(os.getcwd(),'demo2.jpg'), img)
-    obboxes = rboxes[:,1:]
-    class_id = rboxes[:,0]
-    poly_rotae = obb2poly(obboxes)
+    obboxes = rboxes[:,1:].detach().cpu().numpy()
+    class_id = rboxes[:,0].detach().cpu().numpy()
+    poly_rotae = rbox2poly_np(obboxes)
     for rbox,cls_id in zip(poly_rotae,class_id):
         rbox = np.array(rbox.reshape(1,-1,2)).astype(np.int32)
         cls_id = int(cls_id)
         color = (_COLORS[cls_id] * 255).astype(np.uint8).tolist()
         img = np.ascontiguousarray(img, dtype=np.int32)
         cv2.polylines(img, [rbox], True, color, 2)
-    cv2.imwrite(os.path.join(os.getcwd(),'demo.jpg'), img)
+    cv2.imwrite(os.path.join(os.getcwd(),'demo3.jpg'), img)
     return img
         
         
