@@ -103,11 +103,11 @@ def visual(img, bboxes):
     img = img* 255.0
     img = img.astype(np.uint8)
     img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR).astype(np.float32)
-    ipdb.set_trace()
-    bboxes = bboxes[:,0:5]
-    
+    obb_boxes = bboxes[:,0:5]
+
     class_id = bboxes[:,-1:]
-    bboxes = torch.cat([bboxes,class_id],-1)
+
+    bboxes = torch.cat([class_id,bboxes],-1)
     obb_vis(img,bboxes)
 def label_assigner_loss_test(args):
     logger.info("The unit test of label assigner and loss calculation")
@@ -116,12 +116,12 @@ def label_assigner_loss_test(args):
     device = torch.device(f'cuda:{args.device}' if cuda else "cpu")
     cfg = Config.fromfile(args.config)
     # 半精度仅仅针对GPU设备进行处理
-    model = build_model(cfg, num_classes=1, device=device)
+    model = build_model(cfg, num_classes=5, device=device)
     # VisDrone DataSet
     train_loader = create_dataloader(args.anno_file_name, args.img_size[0], args.batch_size,
                                      args.local_rank,args.workers,shuffle=False)[0]
     model.train() #切换到训练模型是
-    compute_loss = ComputeLoss(num_classes=1,
+    compute_loss = ComputeLoss(num_classes=5,
                                         ori_img_size=args.img_size[0],
                                         use_reg_dfl=cfg.model.head.use_reg_dfl,
                                         reg_max= cfg.model.head.reg_max,
@@ -201,11 +201,16 @@ def eval_nms(model,args,cfg, data_info, data_loader):
         images = images.half()
         targets = targets.half()
         outputs, _ = model(images)
+        outputs[...,4] = outputs[...,4]*180/np.pi
         # outputs [bs, n_anchors, 11]
         # [x,y,w,h,theta,conf,theta,cl1,cl2,....,cln] 
         # theta [0,90)
         
-        eval_outputs = non_max_suppression_rotation(outputs,conf_thres=0.03,iou_thres=0.01)
+        eval_outputs = non_max_suppression_rotation(outputs,conf_thres=0.4,iou_thres=0.45)
+        if(len(eval_outputs[0])!=0):
+            ipdb.set_trace()
+            demo = 0
+            visual(images[demo:demo+1,:,:], eval_outputs[demo])
         # print(outputs[0].shape)
         # import copy
         # eval_outputs = copy.deepcopy([x.detach().cpu() for x in outputs])

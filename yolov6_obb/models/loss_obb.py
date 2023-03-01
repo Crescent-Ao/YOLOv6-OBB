@@ -18,7 +18,7 @@ class ComputeLoss:
                  fpn_strides=[8, 16, 32],
                  grid_cell_size=5.0,
                  grid_cell_offset=0.5,
-                 num_classes=10,
+                 num_classes=5,
                  ori_img_size=640,
                  warmup_epoch=4,
                  use_reg_dfl=True,
@@ -81,13 +81,12 @@ class ComputeLoss:
         gt_labels = targets[:, :, :1]
         gt_bboxes = targets[:, :, 1:] # x y w h theta
         gt_bboxes_atss = xywh2xyxy(gt_bboxes[:,:,:-1])
-        mask_gt = (gt_bboxes[:,:,:-2].sum(-1, keepdim=True) > 0).float()
+        mask_gt = (gt_bboxes[:,:,1:-2].sum(-1, keepdim=True) > 0).float()
         anchor_points_s = anchor_points/stride_tensor
         pred_reg_atss, pred_angle = self.obb_decode(anchor_points_s, pred_reg_dist,\
                 pred_angle_dist,stride_tensor,mode="xyxy")
         pred_reg_tal, pred_angle = self.obb_decode(anchor_points_s, pred_reg_dist,\
                 pred_angle_dist,stride_tensor,mode="xywh")
-        #TODO   pred_reg_tal = xyxy2xywh()
         pred_bboxes = torch.concat([pred_reg_tal.clone()*stride_tensor,pred_angle],dim=-1)
         try:
             if epoch_num < self.warmup_epoch:
@@ -209,7 +208,7 @@ class ComputeLoss:
         for i, item in enumerate(targets.cpu().numpy().tolist()):
             targets_list[int(item[0])].append(item[1:])
         max_len = max((len(l) for l in targets_list))
-        targets = torch.from_numpy(np.array(list(map(lambda l:l + [[0,0,0,0,0,0]]*(max_len - len(l)), targets_list)))[:,1:,:]).to(targets.device)
+        targets = torch.from_numpy(np.array(list(map(lambda l:l + [[-1,0,0,0,0,0]]*(max_len - len(l)), targets_list)))[:,1:,:]).to(targets.device)
         batch_target = targets[:,:,1:5]
         targets[...,1:5] = batch_target
         # TODO target.type_as
@@ -231,11 +230,11 @@ class ComputeLoss:
         pred_dist = dist2bbox(pred_dist, points, box_format= mode) 
         return pred_dist, pred_angle
                  
-    def bbox_decode(self, anchor_points, pred_dist):
-        if self.use_dfl:
-            batch_size, n_anchors, _ = pred_dist.shape
-            pred_dist = F.softmax(pred_dist.view(batch_size, n_anchors, 4, self.reg_max + 1), dim=-1).matmul(self.proj.to(pred_dist.device))
-        return dist2bbox(pred_dist, anchor_points)
+    # def bbox_decode(self, anchor_points, pred_dist):
+    #     if self.use_dfl:
+    #         batch_size, n_anchors, _ = pred_dist.shape
+    #         pred_dist = F.softmax(pred_dist.view(batch_size, n_anchors, 4, self.reg_max + 1), dim=-1).matmul(self.proj.to(pred_dist.device))
+    #     return dist2bbox(pred_dist, anchor_points)
 
 
 class VarifocalLoss(nn.Module):
@@ -301,12 +300,12 @@ class BboxLoss(nn.Module):
                 assigned_angle_pos = (
                     assigned_bboxes_pos[:, 4] /
                 self.half_pi_bin)
-                loss_angle_dfl = self._df_loss_angle(pred_angle_pos, assigned_angle_pos)
+                loss_angle_dfl = self._df_loss_angle(pred_angle_pos, assigned_angle_pos) * bbox_weight
                 if assigned_scores_sum == 0:
                     loss_angle_dfl = loss_angle_dfl.sum()
                 else:
                     # loss_angle_dfl = loss_angle_dfl.sum() / assigned_scores_sum
-                    loss_angle_dfl = torch.mean(loss_angle_dfl)
+                    loss_angle_dfl = loss_angle_dfl.sum()/assigned_scores_sum
             else:
                 # ipdb.set_trace()
                 angle_mask = fg_mask.unsqueeze(-1).repeat([1,1,self.angle_max+1])
@@ -320,7 +319,8 @@ class BboxLoss(nn.Module):
                 loss_angle_dfl = F.smooth_l1_loss(assigned_angle_pos, pred_angle_pos).mean()
             if self.use_reg_dfl:
                 bbox_dfl_mask = fg_mask.unsqueeze(-1).repeat([1, 1, 4])
-                dfl_bboxes = assigned_bboxes[:,:,:4].clone()/stride_tensor
+                
+                dfl_bboxes = xywh2xyxy(assigned_bboxes[:,:,:4].clone())/stride_tensor
                 pred_t = pred_reg_dist
                 dist_mask = fg_mask.unsqueeze(-1).repeat(
                     [1, 1, (self.reg_max + 1) * 4])
