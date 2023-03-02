@@ -30,7 +30,7 @@ class ComputeLoss:
                      'class': 1.0,
                      'iou': 2.5,
                      'reg_dfl': 0.5,
-                     'angle_dfl':0.5}
+                     'angle_dfl':0.05}
                  ):
 
         self.fpn_strides = fpn_strides
@@ -80,6 +80,7 @@ class ComputeLoss:
         targets = self.preprocess(targets, batch_size, gt_bboxes_scale)
         gt_labels = targets[:, :, :1]
         gt_bboxes = targets[:, :, 1:] # x y w h theta
+        # NOTE: xywh2xyx
         gt_bboxes_atss = xywh2xyxy(gt_bboxes[:,:,:-1])
         mask_gt = (gt_bboxes[:,:,1:-2].sum(-1, keepdim=True) > 0).float()
         anchor_points_s = anchor_points/stride_tensor
@@ -274,6 +275,7 @@ class BboxLoss(nn.Module):
         self.half_pi_bin = self.half_pi/self.angle_max
 
         # select positive samples mask
+        # ipdb.set_trace()
         num_pos = fg_mask.sum()
         if num_pos > 0:
             # iou loss

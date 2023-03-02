@@ -29,19 +29,19 @@ import copy
 ROOT = os.getcwd()
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
-
+logger.add("./logs/log_{time}.log", rotation="1 day")
 def make_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='image size')  # height, width
-    parser.add_argument('--batch-size', type=int, default=8, help='batch size')
+    parser.add_argument('--batch-size', type=int, default=1, help='batch size')
     parser.add_argument('--half', action='store_true', help='FP16 half-precision export')
     parser.add_argument('--inplace', action='store_true', help='set Detect() inplace=True')
     parser.add_argument('--simplify', action='store_true', help='simplify onnx model')
     parser.add_argument('--dynamic-batch', action='store_true', help='export dynamic batch onnx model')
     parser.add_argument('--device', default='0', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--config', default='/home/crescent/YOLOv6-OBB/configs/repopt/yolov6_tiny_opt.py',help='Model configuration')
+    parser.add_argument('--config', default='/home/crescent/YOLOv6-OBB/configs/yolov6m.py',help='Model configuration')
     parser.add_argument('--img_size', default=640,help = 'Dataloader img size')
-    parser.add_argument('--anno_file_name', default="/home/crescent/YOLOv6-OBB/train_demo_1.txt")
+    parser.add_argument('--anno_file_name', default="/home/crescent/YOLOv6-OBB/train_DroneVehicle.txt")
     parser.add_argument('--dist_url', default='env://', type=str, help='url used to set up distributed training')
     parser.add_argument('--gpu_count', type=int, default=0)
     parser.add_argument('--local_rank', type=int, default=-1, help='DDP parameter')
@@ -80,13 +80,14 @@ def model_dataloader(args,visualize=True):
 ):
     """
     train_loader = create_dataloader(args.anno_file_name, args.img_size[0], args.batch_size,
-                                     args.local_rank,args.workers,shuffle=False)[0]
+                                     args.local_rank,args.workers,shuffle=True)[0]
    
     if visualize:
         img, bboxes = iter(train_loader).__next__()
         img = img.squeeze(0).permute(1,2,0).detach().cpu().numpy()
         img = img* 255.0
         img = img.astype(np.uint8)
+        
         print(img.shape)
         img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR).astype(np.float32)
         print(bboxes)
@@ -163,6 +164,7 @@ def label_assigner_loss_test(args):
                     for k, param in enumerate(optimizer.param_groups):
                         warmup_bias_lr = cfg.solver.warmup_bias_lr if k == 2 else 0.0
                         param['lr'] = np.interp(curr_step, [0, warmup_stepnum], [warmup_bias_lr, param['initial_lr'] * lf(epoch_num)])
+                        # logger.info(param['lr'])
                         if 'momentum' in param:
                             param['momentum'] = np.interp(curr_step, [0, warmup_stepnum], [cfg.solver.warmup_momentum, cfg.solver.momentum])
             if curr_step - last_opt_step >= accumulate:
@@ -172,7 +174,7 @@ def label_assigner_loss_test(args):
                     last_opt_step = curr_step
             last_opt_step = curr_step
         logger.info(f"{total_loss}")
-        if(epoch_num>=20 and epoch_num%2==0):
+        if(epoch_num>=30 and epoch_num%10==0):
             eval_nms(copy.deepcopy(model),args,cfg,data_info,train_loader)
         
 @torch.no_grad()
@@ -206,9 +208,8 @@ def eval_nms(model,args,cfg, data_info, data_loader):
         # [x,y,w,h,theta,conf,theta,cl1,cl2,....,cln] 
         # theta [0,90)
         
-        eval_outputs = non_max_suppression_rotation(outputs,conf_thres=0.4,iou_thres=0.45)
+        eval_outputs = non_max_suppression_rotation(outputs,conf_thres=0.1,iou_thres=0.5)
         if(len(eval_outputs[0])!=0):
-            ipdb.set_trace()
             demo = 0
             visual(images[demo:demo+1,:,:], eval_outputs[demo])
         # print(outputs[0].shape)
