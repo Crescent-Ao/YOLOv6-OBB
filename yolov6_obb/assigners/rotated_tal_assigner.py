@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F  
 import mmcv.ops.box_iou_rotated as box_iou_rotated
 from yolov6_obb.utils.obb_utils import rotated_iou_similarity
-from yolov6_obb.utils.obb_utils import check_point_in_rotated_boxes
+from yolov6_obb.models.rbox_utils import check_points_in_rotated_boxes
 from yolov6_obb.assigners.assigner_utils import select_highest_overlaps
 import ipdb
 class RotatedTaskAlignedAssigner(nn.Module):
@@ -53,7 +53,7 @@ class RotatedTaskAlignedAssigner(nn.Module):
                    torch.zeros_like(pred_bboxes).to(device), \
                    torch.zeros_like(pred_scores).to(device), \
                    torch.zeros_like(pred_scores[..., 0]).to(device)
-       
+        
         mask_pos, align_metric, overlaps = self.get_pos_mask(
             pred_scores, pred_bboxes, gt_labels, gt_bboxes, anchor_points, mask_gt)
         target_gt_idx, fg_mask, mask_pos = select_highest_overlaps(
@@ -75,10 +75,10 @@ class RotatedTaskAlignedAssigner(nn.Module):
                      gt_bboxes,
                      anchor_points,
                      mask_gt):
-  
+     
         align_metric, overlaps = self.get_box_metrics(pred_scores, pred_bboxes, gt_labels, gt_bboxes)
          # check the positive sample's center in gt, [B, n, L]
-        mask_in_gts = check_point_in_rotated_boxes(anchor_points, gt_bboxes)
+        mask_in_gts = check_points_in_rotated_boxes(anchor_points, gt_bboxes)
         mask_topk = self.select_topk_candidates(
             align_metric * mask_in_gts, topk_mask=mask_gt.repeat([1, 1, self.topk]).bool())
         mask_pos = mask_topk * mask_in_gts * mask_gt

@@ -27,10 +27,10 @@ class ComputeLoss:
                  angle_max = 90,
                  iou_type='giou',
                  loss_weight={
-                     'class': 1.0,
+                     'class': 1 ,
                      'iou': 2.5,
                      'reg_dfl': 0.5,
-                     'angle_dfl':0.05}
+                     'angle_dfl':0.1}
                  ):
 
         self.fpn_strides = fpn_strides
@@ -38,7 +38,7 @@ class ComputeLoss:
         self.grid_cell_offset = grid_cell_offset
         self.num_classes = num_classes
         self.ori_img_size = ori_img_size
-        self.warmup_epoch = 300
+        self.warmup_epoch = 5
         self.warmup_assigner = ATSSAssigner(9, num_classes=self.num_classes)
         self.formal_assigner = RotatedTaskAlignedAssigner(topk=13, num_classes=self.num_classes, alpha=1.0, beta=6.0)
         
@@ -103,13 +103,13 @@ class ComputeLoss:
             else:
                 target_labels, target_bboxes, target_scores, fg_mask = \
                     self.formal_assigner(
-                        pred_scores.detach(),
-                        torch.cat([pred_reg_tal.detach()*stride_tensor,pred_angle.detach()],axis=-1),
-                        anchor_points,
+                        pred_scores.detach().type_as(gt_labels),
+                        torch.cat([pred_reg_tal.detach()*stride_tensor,pred_angle.detach()],axis=-1).type_as(gt_labels),
+                        anchor_points.type_as(gt_labels),
                         gt_labels,
                         gt_bboxes,
-                        mask_gt)
-
+                        mask_gt.type_as(gt_labels))
+                    # mmcv 需要fp32 进行计算
         except RuntimeError:
             print(
                 "OOM RuntimeError is raised due to the huge memory cost during label assignment. \
@@ -259,7 +259,7 @@ class BboxLoss(nn.Module):
         super(BboxLoss, self).__init__()
         self.num_classes = num_classes
         self.iou_loss = IOUloss(box_format="xywh",iou_type="ciou")
-        # self.iou_loss = 
+        # self.iou_loss = ProbIoUloss()
         self.reg_max = reg_max
         self.angle_max = angle_max
         self.use_reg_dfl = use_reg_dfl
@@ -289,6 +289,8 @@ class BboxLoss(nn.Module):
                 assigned_scores.sum(-1), fg_mask).unsqueeze(-1)
             loss_iou = self.iou_loss(pred_bboxes_pos[...,:-1],
                                      assigned_bboxes_pos[...,:-1]) * bbox_weight
+            # loss_iou = self.iou_loss(pred_bboxes_pos,
+            #                          assigned_bboxes_pos) * bbox_weight
             if assigned_scores_sum == 0:
                 loss_iou = loss_iou.sum()
             else:
